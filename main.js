@@ -1,9 +1,11 @@
 // --- API base detection ---
-// Set this to your LocalTunnel URL (HTTPS)
-const PROD_API = "https://bumpy-shoes-cross.loca.lt";
-const API_BASE = location.hostname.endsWith("github.io")
-  ? PROD_API
-  : "http://localhost:8081";
+// Production API = your Render URL (HTTPS, no trailing slash)
+const PROD_API = "https://sl-backend-zbny.onrender.com";
+// Local dev API = your local server (adjust if you use a different port)
+const LOCAL_DEV_API = "http://localhost:8081";
+
+// Use PROD when hosted on GitHub Pages; otherwise use local
+const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
 // --- DOM refs ---
 const fromQ   = document.getElementById("fromQuery");
@@ -167,10 +169,10 @@ swapBtn.addEventListener("click", () => {
   const fText = fromQ.value;
   fromQ.value = toQ.value;
   toQ.value = fText;
-  [fromId, toId]   = [toId, fromId];
+  [fromId, toId]     = [toId, fromId];
   [fromName, toName] = [toName, fromName];
-  [fromLat, toLat] = [toLat, fromLat];
-  [fromLon, toLon] = [toLon, fromLon];
+  [fromLat, toLat]   = [toLat, fromLat];
+  [fromLon, toLon]   = [toLon, fromLon];
   if (fromLat != null && fromLon != null) setMarker("from", fromLat, fromLon, `From: ${fromName}`);
   if (toLat != null && toLon != null)     setMarker("to", toLat, toLon, `To: ${toName}`);
   fitToContent();
@@ -245,7 +247,8 @@ goBtn.addEventListener("click", async () => {
 // Health check
 (async () => {
   try {
-    const res = await fetch(`${API_BASE}/health`);
+    // Note: some hosts cold-start; first request may be slow
+    const res = await fetch(`${API_BASE}/health`, { cache: "no-store" });
     if (!res.ok) throw new Error("Backend not reachable");
   } catch (e) {
     setStatus("Backend not reachable at " + API_BASE + " (" + e.message + ")");
