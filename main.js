@@ -1,6 +1,9 @@
-// Point this to your backend URL.
-// Local dev default:
-const API_BASE = "http://localhost:8080";
+// --- API base detection ---
+// TODO: change PROD_API to your public backend URL after you deploy it.
+const PROD_API = "https://github.com/AxelBackman/sl-backend";
+const API_BASE = location.hostname.endsWith("github.io")
+  ? PROD_API
+  : "http://localhost:8080";
 
 // --- DOM refs ---
 const fromQ   = document.getElementById("fromQuery");
@@ -13,7 +16,7 @@ const swapBtn = document.getElementById("swapBtn");
 const statusEl= document.getElementById("status");
 const legsEl  = document.getElementById("legs");
 
-// Selected stop IDs + names + coords cache (we store coords when you pick a suggestion)
+// Selected stop IDs + names + coords cache
 let fromId = "";
 let toId   = "";
 let fromName = "";
@@ -21,17 +24,17 @@ let toName = "";
 let fromLat = null, fromLon = null;
 let toLat = null, toLon = null;
 
-// Cache by id -> {id, name, lat, lon}
+// Cache: stopId -> { id, name, lat, lon }
 const stopCache = new Map();
 
 // --- Leaflet map setup + layers ---
 let map;
 let fromMarker = null;
 let toMarker = null;
-let routeLayer = L.layerGroup(); // polylines and any mid-leg markers
+let routeLayer = L.layerGroup(); // holds polylines for current route
 
 function initMap() {
-  // Stockholm center
+  // Center on Stockholm
   const stockholm = [59.3293, 18.0686];
 
   map = L.map("map", { zoomControl: true }).setView(stockholm, 11);
@@ -45,9 +48,9 @@ function initMap() {
 
   routeLayer.addTo(map);
 }
-initMap(); // render once on load
+initMap();
 
-// --- Helpers ---
+// --- Utilities ---
 function hhmm(totalMin) {
   const h = Math.floor(totalMin / 60), m = totalMin % 60;
   return String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0");
@@ -55,7 +58,7 @@ function hhmm(totalMin) {
 function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function setStatus(msg) { statusEl.textContent = msg || ""; }
 
-// Create/update a marker (simple circle style so it’s lightweight)
+// Marker helper (circle markers for lightweight rendering)
 function setMarker(kind, lat, lon, label) {
   const color = (kind === "from") ? "#0b7" : "#d33";
   const opt = { radius: 8, weight: 2, color, fillColor: color, fillOpacity: 0.6 };
@@ -69,28 +72,45 @@ function setMarker(kind, lat, lon, label) {
   }
 }
 
-// Fit map to whatever we currently have (route + markers)
+// Safe bounds that avoids "getLatLng is not a function"
 function fitToContent() {
-  const group = L.featureGroup([routeLayer, fromMarker, toMarker].filter(Boolean));
-  if (group.getLayers().length > 0) map.fitBounds(group.getBounds().pad(0.2));
+  let bounds = null;
+
+  // Include route polylines if present
+  if (routeLayer && routeLayer.getLayers && routeLayer.getLayers().length > 0) {
+    try {
+      bounds = routeLayer.getBounds();
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  // Include endpoint markers if present
+  if (fromMarker && fromMarker.getLatLng) {
+    const ll = fromMarker.getLatLng();
+    bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
+  }
+  if (toMarker && toMarker.getLatLng) {
+    const ll = toMarker.getLatLng();
+    bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
+  }
+
+  if (bounds) map.fitBounds(bounds.pad(0.2));
 }
 
-// Resolve stop coordinates by id/name using your /api/stops search
-// Important: your backend returns StopDto {id,name,lat,lon}, so we can resolve endpoints for drawing.
+// Resolve stop coordinates using /api/stops (backend returns {id,name,lat,lon})
 async function resolveStop(id, name) {
-  if (id && stopCache.has(id)) return stopCache.get(id);
+  if (id && stopCache.has(String(id))) return stopCache.get(String(id));
 
-  // Fall back to name search (server returns {id,name,lat,lon})
   const url = `${API_BASE}/api/stops?q=${encodeURIComponent(name || "")}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("stop lookup failed");
   const arr = await res.json();
 
-  // Try exact id match first, else name match, else first result
   let found = null;
   if (id) found = arr.find(s => String(s.id) === String(id));
   if (!found && name) {
-    const n = name.toLowerCase();
+    const n = (name || "").toLowerCase();
     found = arr.find(s => (s.name || "").toLowerCase() === n) || arr[0];
   } else if (!found) {
     found = arr[0];
@@ -103,7 +123,7 @@ async function resolveStop(id, name) {
   throw new Error("stop not found");
 }
 
-// --- Stop search (debounced fetch to /api/stops?q=) ---
+// --- Stop suggestions (debounced) ---
 let fromTimer = 0, toTimer = 0;
 
 fromQ.addEventListener("input", () => {
@@ -115,10 +135,8 @@ fromQ.addEventListener("input", () => {
   fromTimer = setTimeout(() => searchStops(q, fromList, (s) => {
     fromId = s.id; fromName = s.name; fromQ.value = s.name;
     fromLat = s.lat; fromLon = s.lon;
-    stopCache.set(String(s.id), s); // keep for later route drawing
+    stopCache.set(String(s.id), s);
     clearElement(fromList);
-
-    // Update marker immediately when a suggestion is chosen
     setMarker("from", s.lat, s.lon, `From: ${s.name}`);
     fitToContent();
   }), 200);
@@ -135,7 +153,6 @@ toQ.addEventListener("input", () => {
     toLat = s.lat; toLon = s.lon;
     stopCache.set(String(s.id), s);
     clearElement(toList);
-
     setMarker("to", s.lat, s.lon, `To: ${s.name}`);
     fitToContent();
   }), 200);
@@ -174,30 +191,21 @@ swapBtn.addEventListener("click", () => {
   [fromLat, toLat] = [toLat, fromLat];
   [fromLon, toLon] = [toLon, fromLon];
 
-  // update markers if we have coords
   if (fromLat != null && fromLon != null) setMarker("from", fromLat, fromLon, `From: ${fromName}`);
   if (toLat != null && toLon != null) setMarker("to", toLat, toLon, `To: ${toName}`);
   fitToContent();
 });
 
-// --- Find route (POST /api/route) and draw on the map ---
+// --- Route + draw ---
 goBtn.addEventListener("click", async () => {
   setStatus("");
   clearElement(legsEl);
-  routeLayer.clearLayers(); // remove any previous route
+  routeLayer.clearLayers(); // reset previous route lines
 
-  // Validate minimal inputs
-  if (!fromId && !fromQ.value.trim()) {
-    setStatus("Pick a 'From' stop.");
-    return;
-  }
-  if (!toId && !toQ.value.trim()) {
-    setStatus("Pick a 'To' stop.");
-    return;
-  }
+  if (!fromId && !fromQ.value.trim()) return setStatus("Pick a 'From' stop.");
+  if (!toId && !toQ.value.trim())     return setStatus("Pick a 'To' stop.");
 
   const body = {
-    // Server accepts either IDs or names; we send both safely.
     fromId: fromId || undefined,
     toId: toId || undefined,
     fromName: fromName || (fromId ? undefined : fromQ.value.trim()),
@@ -217,13 +225,15 @@ goBtn.addEventListener("click", async () => {
       return;
     }
 
-    // Render legs
     const { legs, total, transfers } = data;
+
+    // itinerary header
     const hdr = document.createElement("div");
     hdr.className = "muted";
     hdr.textContent = `Total: ${Math.round(total)} min  ·  Transfers: ${transfers}`;
     legsEl.appendChild(hdr);
 
+    // itinerary cards
     for (const leg of legs) {
       const card = document.createElement("div");
       card.className = "card";
@@ -235,16 +245,16 @@ goBtn.addEventListener("click", async () => {
       legsEl.appendChild(card);
     }
 
-    // Draw legs on the map (resolve leg endpoints to coordinates)
+    // draw polylines for legs
     for (const leg of legs) {
       const a = await resolveStop(leg.fromId, leg.fromName);
       const b = await resolveStop(leg.toId, leg.toName);
       L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
     }
 
-    // Ensure endpoint markers are set from first/last leg
+    // ensure endpoint markers from first/last leg
     const first = legs[0];
-    const last = legs[legs.length - 1];
+    const last  = legs[legs.length - 1];
     const a0 = await resolveStop(first.fromId, first.fromName);
     const bN = await resolveStop(last.toId, last.toName);
 
@@ -263,7 +273,7 @@ goBtn.addEventListener("click", async () => {
   }
 });
 
-// Optional: quick health check on load for clearer errors
+// Optional: quick health check on load for clearer errors in dev/prod
 (async () => {
   try {
     const res = await fetch(`${API_BASE}/health`);
