@@ -1,0 +1,26 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+
+# Logs and caches
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+.cache/
+.tmp/
+
+# Builds (if you add a bundler later)
+dist/
+build/
+
+# Node (if you add tooling later)
+node_modules/
+
+# Misc
+*.local
