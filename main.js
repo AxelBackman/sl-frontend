@@ -1,9 +1,9 @@
 // --- API base detection ---
-// TODO: change PROD_API to your public backend URL after you deploy it.
-const PROD_API = "https://github.com/AxelBackman/sl-backend";
+// Set this to your LocalTunnel URL (HTTPS)
+const PROD_API = "https://bumpy-shoes-cross.loca.lt";
 const API_BASE = location.hostname.endsWith("github.io")
   ? PROD_API
-  : "http://localhost:8080";
+  : "http://localhost:8081";
 
 // --- DOM refs ---
 const fromQ   = document.getElementById("fromQuery");
@@ -31,22 +31,17 @@ const stopCache = new Map();
 let map;
 let fromMarker = null;
 let toMarker = null;
-// IMPORTANT: use FeatureGroup (supports getBounds), not LayerGroup
+// FeatureGroup supports getBounds()
 let routeLayer = L.featureGroup();
 
 function initMap() {
-  // Center on Stockholm
   const stockholm = [59.3293, 18.0686];
-
   map = L.map("map", { zoomControl: true }).setView(stockholm, 11);
-
-  // OSM tiles
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
     attribution:
       '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map);
-
   routeLayer.addTo(map);
 }
 initMap();
@@ -59,7 +54,7 @@ function hhmm(totalMin) {
 function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function setStatus(msg) { statusEl.textContent = msg || ""; }
 
-// Marker helper (circle markers for lightweight rendering)
+// Marker helper
 function setMarker(kind, lat, lon, label) {
   const color = (kind === "from") ? "#0b7" : "#d33";
   const opt = { radius: 8, weight: 2, color, fillColor: color, fillOpacity: 0.6 };
@@ -76,13 +71,9 @@ function setMarker(kind, lat, lon, label) {
 // Fit map to route + endpoint markers
 function fitToContent() {
   let bounds = null;
-
-  // Route polylines
   if (routeLayer && routeLayer.getLayers && routeLayer.getLayers().length > 0) {
     bounds = routeLayer.getBounds();
   }
-
-  // Endpoint markers
   if (fromMarker && fromMarker.getLatLng) {
     const ll = fromMarker.getLatLng();
     bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
@@ -91,19 +82,16 @@ function fitToContent() {
     const ll = toMarker.getLatLng();
     bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
   }
-
   if (bounds) map.fitBounds(bounds.pad(0.2));
 }
 
-// Resolve stop coordinates using /api/stops (backend returns {id,name,lat,lon})
+// Resolve stop coords via /api/stops
 async function resolveStop(id, name) {
   if (id && stopCache.has(String(id))) return stopCache.get(String(id));
-
   const url = `${API_BASE}/api/stops?q=${encodeURIComponent(name || "")}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error("stop lookup failed");
   const arr = await res.json();
-
   let found = null;
   if (id) found = arr.find(s => String(s.id) === String(id));
   if (!found && name) {
@@ -112,7 +100,6 @@ async function resolveStop(id, name) {
   } else if (!found) {
     found = arr[0];
   }
-
   if (found) {
     stopCache.set(String(found.id), found);
     return found;
@@ -177,19 +164,15 @@ async function searchStops(query, listEl, onPick) {
 
 // --- Swap ---
 swapBtn.addEventListener("click", () => {
-  // swap text
   const fText = fromQ.value;
   fromQ.value = toQ.value;
   toQ.value = fText;
-
-  // swap ids/names/coords
-  [fromId, toId] = [toId, fromId];
+  [fromId, toId]   = [toId, fromId];
   [fromName, toName] = [toName, fromName];
   [fromLat, toLat] = [toLat, fromLat];
   [fromLon, toLon] = [toLon, fromLon];
-
   if (fromLat != null && fromLon != null) setMarker("from", fromLat, fromLon, `From: ${fromName}`);
-  if (toLat != null && toLon != null) setMarker("to", toLat, toLon, `To: ${toName}`);
+  if (toLat != null && toLon != null)     setMarker("to", toLat, toLon, `To: ${toName}`);
   fitToContent();
 });
 
@@ -197,7 +180,7 @@ swapBtn.addEventListener("click", () => {
 goBtn.addEventListener("click", async () => {
   setStatus("");
   clearElement(legsEl);
-  routeLayer.clearLayers(); // reset previous route lines
+  routeLayer.clearLayers();
 
   if (!fromId && !fromQ.value.trim()) return setStatus("Pick a 'From' stop.");
   if (!toId && !toQ.value.trim())     return setStatus("Pick a 'To' stop.");
@@ -224,13 +207,11 @@ goBtn.addEventListener("click", async () => {
 
     const { legs, total, transfers } = data;
 
-    // itinerary header
     const hdr = document.createElement("div");
     hdr.className = "muted";
     hdr.textContent = `Total: ${Math.round(total)} min  ·  Transfers: ${transfers}`;
     legsEl.appendChild(hdr);
 
-    // itinerary cards
     for (const leg of legs) {
       const card = document.createElement("div");
       card.className = "card";
@@ -242,27 +223,18 @@ goBtn.addEventListener("click", async () => {
       legsEl.appendChild(card);
     }
 
-    // draw polylines for legs
     for (const leg of legs) {
       const a = await resolveStop(leg.fromId, leg.fromName);
       const b = await resolveStop(leg.toId, leg.toName);
       L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
     }
 
-    // ensure endpoint markers from first/last leg
     const first = legs[0];
     const last  = legs[legs.length - 1];
     const a0 = await resolveStop(first.fromId, first.fromName);
     const bN = await resolveStop(last.toId, last.toName);
-
-    if (a0) {
-      fromLat = a0.lat; fromLon = a0.lon; fromName = a0.name; fromId = String(a0.id);
-      setMarker("from", a0.lat, a0.lon, `From: ${a0.name}`);
-    }
-    if (bN) {
-      toLat = bN.lat; toLon = bN.lon; toName = bN.name; toId = String(bN.id);
-      setMarker("to", bN.lat, bN.lon, `To: ${bN.name}`);
-    }
+    if (a0) { fromLat = a0.lat; fromLon = a0.lon; fromName = a0.name; fromId = String(a0.id); setMarker("from", a0.lat, a0.lon, `From: ${a0.name}`); }
+    if (bN) { toLat   = bN.lat; toLon   = bN.lon; toName = bN.name; toId   = String(bN.id);   setMarker("to", bN.lat, bN.lon, `To: ${bN.name}`); }
 
     fitToContent();
   } catch (e) {
@@ -270,7 +242,7 @@ goBtn.addEventListener("click", async () => {
   }
 });
 
-// Optional: quick health check on load for clearer errors in dev/prod
+// Health check
 (async () => {
   try {
     const res = await fetch(`${API_BASE}/health`);
