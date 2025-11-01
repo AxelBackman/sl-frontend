@@ -31,7 +31,8 @@ const stopCache = new Map();
 let map;
 let fromMarker = null;
 let toMarker = null;
-let routeLayer = L.layerGroup(); // holds polylines for current route
+// IMPORTANT: use FeatureGroup (supports getBounds), not LayerGroup
+let routeLayer = L.featureGroup();
 
 function initMap() {
   // Center on Stockholm
@@ -72,20 +73,16 @@ function setMarker(kind, lat, lon, label) {
   }
 }
 
-// Safe bounds that avoids "getLatLng is not a function"
+// Fit map to route + endpoint markers
 function fitToContent() {
   let bounds = null;
 
-  // Include route polylines if present
+  // Route polylines
   if (routeLayer && routeLayer.getLayers && routeLayer.getLayers().length > 0) {
-    try {
-      bounds = routeLayer.getBounds();
-    } catch (_) {
-      // ignore
-    }
+    bounds = routeLayer.getBounds();
   }
 
-  // Include endpoint markers if present
+  // Endpoint markers
   if (fromMarker && fromMarker.getLatLng) {
     const ll = fromMarker.getLatLng();
     bounds = bounds ? bounds.extend(ll) : L.latLngBounds(ll, ll);
