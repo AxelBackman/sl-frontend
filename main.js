@@ -54,7 +54,9 @@ function hhmm(totalMin) {
 function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function setStatus(msg) { statusEl.textContent = msg || ""; }
 
-async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -65,17 +67,28 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
-// Wake the backend gently (Render free may be cold). We call this before the first search and route.
-let lastHealthPing = 0;
-async function wakeBackendIfIdle() {
-  const now = Date.now();
-  if (now - lastHealthPing < 60000) return; // once per minute max
-  lastHealthPing = now;
-  try {
-    await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 10000);
-  } catch (_) {
-    // ignore; main request will still show a nice error
+// Wake loop for cold starts: try /health with backoff up to ~60s total
+async function wakeBackend() {
+  const attempts = [0, 1000, 2000, 4000, 8000, 12000, 16000, 20000]; // cumulative ~63s
+  for (let i = 0; i < attempts.length; i++) {
+    if (i > 0) {
+      setStatus(`Waking backend… (attempt ${i + 1}/${attempts.length})`);
+      await sleep(attempts[i]);
+    } else {
+      setStatus("Waking backend…");
+    }
+    try {
+      const res = await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 45000);
+      if (res.ok) {
+        setStatus(""); // awake
+        return true;
+      }
+    } catch (_) {
+      // continue loop
+    }
   }
+  setStatus("Backend still sleeping or unreachable.");
+  return false;
 }
 
 // Marker helper
@@ -113,7 +126,7 @@ function fitToContent() {
 async function resolveStop(id, name) {
   if (id && stopCache.has(String(id))) return stopCache.get(String(id));
   const url = `${API_BASE}/api/stops?q=${encodeURIComponent(name || "")}`;
-  const res = await fetchWithTimeout(url, { cache: "no-store" }, 15000);
+  const res = await fetchWithTimeout(url, { cache: "no-store" }, 45000);
   if (!res.ok) throw new Error("stop lookup failed");
   const arr = await res.json();
   let found = null;
@@ -131,7 +144,7 @@ async function resolveStop(id, name) {
   throw new Error("stop not found");
 }
 
-// --- Stop suggestions (debounced, with status + retry) ---
+// --- Stop suggestions (debounced, with wake + retry) ---
 let fromTimer = 0, toTimer = 0;
 
 fromQ.addEventListener("input", () => {
@@ -168,33 +181,36 @@ toQ.addEventListener("input", () => {
 
 async function doSearchStops(query, listEl, onPick) {
   setStatus("Searching stops…");
-  await wakeBackendIfIdle();
+  // Make sure backend is awake first
+  await wakeBackend();
 
   const url = `${API_BASE}/api/stops?q=${encodeURIComponent(query)}`;
-  try {
-    let res = await fetchWithTimeout(url, { cache: "no-store" }, 15000);
-    // If the backend just woke up and returned a gateway error, retry once after a short pause
-    if (!res.ok && res.status >= 500) {
-      await new Promise(r => setTimeout(r, 800));
-      res = await fetchWithTimeout(url, { cache: "no-store" }, 15000);
+  const backoffs = [0, 800, 1600, 3200]; // up to ~5.6s extra
+  for (let i = 0; i < backoffs.length; i++) {
+    if (i > 0) {
+      setStatus(`Searching stops… (retry ${i + 1}/${backoffs.length})`);
+      await sleep(backoffs[i]);
     }
-    if (!res.ok) throw new Error(`Stop search failed (${res.status})`);
-
-    const items = await res.json();
-    clearElement(listEl);
-    for (const s of items) {
-      const li = document.createElement("li");
-      const btn = document.createElement("button");
-      btn.textContent = `${s.name}  ·  ${s.id}`;
-      btn.addEventListener("click", () => onPick(s));
-      li.appendChild(btn);
-      listEl.appendChild(li);
+    try {
+      const res = await fetchWithTimeout(url, { cache: "no-store" }, 45000);
+      if (!res.ok) throw new Error(`Stop search failed (${res.status})`);
+      const items = await res.json();
+      clearElement(listEl);
+      for (const s of items) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.textContent = `${s.name}  ·  ${s.id}`;
+        btn.addEventListener("click", () => onPick(s));
+        li.appendChild(btn);
+        listEl.appendChild(li);
+      }
+      setStatus(items.length ? "" : "No stops found.");
+      return;
+    } catch (err) {
+      // loop and retry
     }
-    if (items.length === 0) setStatus("No stops found.");
-    else setStatus("");
-  } catch (err) {
-    setStatus("Error searching stops: " + err.message);
   }
+  setStatus("Error searching stops (backend slow/unreachable).");
 }
 
 // --- Swap ---
@@ -211,7 +227,7 @@ swapBtn.addEventListener("click", () => {
   fitToContent();
 });
 
-// --- Route + draw (with wake + timeout) ---
+// --- Route + draw (wake + retries) ---
 goBtn.addEventListener("click", async () => {
   setStatus("");
   clearElement(legsEl);
@@ -220,7 +236,7 @@ goBtn.addEventListener("click", async () => {
   if (!fromId && !fromQ.value.trim()) return setStatus("Pick a 'From' stop.");
   if (!toId && !toQ.value.trim())     return setStatus("Pick a 'To' stop.");
 
-  await wakeBackendIfIdle();
+  await wakeBackend();
 
   const body = {
     fromId: fromId || undefined,
@@ -230,74 +246,73 @@ goBtn.addEventListener("click", async () => {
     depart: depart.value || "08:00"
   };
 
-  try {
-    let res = await fetchWithTimeout(`${API_BASE}/api/route`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      cache: "no-store"
-    }, 20000);
-
-    if (!res.ok && res.status >= 500) {
-      // possible cold start hiccup; retry once
-      await new Promise(r => setTimeout(r, 800));
-      res = await fetchWithTimeout(`${API_BASE}/api/route`, {
+  const backoffs = [0, 1000, 2000, 4000]; // a couple of retries
+  for (let i = 0; i < backoffs.length; i++) {
+    if (i > 0) {
+      setStatus(`Finding route… (retry ${i + 1}/${backoffs.length})`);
+      await sleep(backoffs[i]);
+    }
+    try {
+      const res = await fetchWithTimeout(`${API_BASE}/api/route`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
         cache: "no-store"
-      }, 20000);
-    }
+      }, 45000);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        setStatus(data.error || "No route found.");
+        return;
+      }
 
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || !data.ok) {
-      setStatus(data.error || "No route found.");
+      const { legs, total, transfers } = data;
+
+      const hdr = document.createElement("div");
+      hdr.className = "muted";
+      hdr.textContent = `Total: ${Math.round(total)} min  ·  Transfers: ${transfers}`;
+      legsEl.appendChild(hdr);
+
+      for (const leg of legs) {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `
+          <div><b>${leg.trip || ""}</b> ${leg.headsign ? "· " + leg.headsign : ""}</div>
+          <div><b>${hhmm(leg.dep)}</b> ${leg.fromName}</div>
+          <div><b>${hhmm(leg.arr)}</b> ${leg.toName}</div>
+        `;
+        legsEl.appendChild(card);
+      }
+
+      for (const leg of legs) {
+        const a = await resolveStop(leg.fromId, leg.fromName);
+        const b = await resolveStop(leg.toId, leg.toName);
+        L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
+      }
+
+      const first = legs[0];
+      const last  = legs[legs.length - 1];
+      const a0 = await resolveStop(first.fromId, first.fromName);
+      const bN = await resolveStop(last.toId, last.toName);
+      if (a0) { fromLat = a0.lat; fromLon = a0.lon; fromName = a0.name; fromId = String(a0.id); setMarker("from", a0.lat, a0.lon, `From: ${a0.name}`); }
+      if (bN) { toLat   = bN.lat; toLon   = bN.lon; toName = bN.name; toId   = String(bN.id);   setMarker("to", bN.lat, bN.lon, `To: ${bN.name}`); }
+
+      fitToContent();
+      setStatus("");
       return;
+    } catch (e) {
+      // continue loop
     }
-
-    const { legs, total, transfers } = data;
-
-    const hdr = document.createElement("div");
-    hdr.className = "muted";
-    hdr.textContent = `Total: ${Math.round(total)} min  ·  Transfers: ${transfers}`;
-    legsEl.appendChild(hdr);
-
-    for (const leg of legs) {
-      const card = document.createElement("div");
-      card.className = "card";
-      card.innerHTML = `
-        <div><b>${leg.trip || ""}</b> ${leg.headsign ? "· " + leg.headsign : ""}</div>
-        <div><b>${hhmm(leg.dep)}</b> ${leg.fromName}</div>
-        <div><b>${hhmm(leg.arr)}</b> ${leg.toName}</div>
-      `;
-      legsEl.appendChild(card);
-    }
-
-    for (const leg of legs) {
-      const a = await resolveStop(leg.fromId, leg.fromName);
-      const b = await resolveStop(leg.toId, leg.toName);
-      L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
-    }
-
-    const first = legs[0];
-    const last  = legs[legs.length - 1];
-    const a0 = await resolveStop(first.fromId, first.fromName);
-    const bN = await resolveStop(last.toId, last.toName);
-    if (a0) { fromLat = a0.lat; fromLon = a0.lon; fromName = a0.name; fromId = String(a0.id); setMarker("from", a0.lat, a0.lon, `From: ${a0.name}`); }
-    if (bN) { toLat   = bN.lat; toLon   = bN.lon; toName = bN.name; toId   = String(bN.id);   setMarker("to", bN.lat, bN.lon, `To: ${bN.name}`); }
-
-    fitToContent();
-  } catch (e) {
-    setStatus("Error: " + e.message);
   }
+  setStatus("Error finding route (backend slow/unreachable).");
 });
 
-// Health check on load (no-cache; just for user feedback)
+// Health check on load (no-cache) with patient timeout
 (async () => {
   try {
-    const res = await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 10000);
+    const res = await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 45000);
     if (!res.ok) throw new Error("Backend not reachable");
   } catch (e) {
-    setStatus("Backend not reachable at " + API_BASE + " (" + e.message + ")");
+    // Leave a helpful message for the user
+    setStatus("Backend not reachable at " + API_BASE + " (" + (e?.message || "network error") + ")");
   }
 })();
