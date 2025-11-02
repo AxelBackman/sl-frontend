@@ -24,8 +24,77 @@ let fromName = "", toName = "";
 let fromLat = null, fromLon = null;
 let toLat = null, toLon = null;
 
-// Cache: stopId -> { id, name, lat, lon }
-const stopCache = new Map();
+// --- In-browser stops data (loaded from stops.csv) ---
+/**
+ * After load, stops = [{ id: "740001174", name: "Stockholm Frihamnen", lat: 59.341502, lon: 18.117975 }, ...]
+ */
+let stops = [];
+const stopById = new Map();
+
+async function loadStopsCsv() {
+  setStatus("Loading stations…");
+  const res = await fetch("./stops.csv", { cache: "no-store" });
+  if (!res.ok) throw new Error("failed to load stops.csv");
+  const text = await res.text();
+
+  // Parse a simple CSV: id,name,lat,lon,(ignore rest)
+  // Handles optional header; trims whitespace; ignores empty lines.
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+
+    // naive split (OK for your data; no quoted commas expected)
+    const cols = raw.split(",").map(s => s.trim());
+    if (cols.length < 4) continue;
+
+    // Skip header row if present
+    if (i === 0 && (cols[0].toLowerCase().includes("id") || cols[2].toLowerCase().includes("lat"))) {
+      continue;
+    }
+
+    const id  = cols[0];
+    const name= cols[1];
+    const lat = parseFloat(cols[2]);
+    const lon = parseFloat(cols[3]);
+
+    if (!id || !name || !Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    out.push({ id, name, lat, lon });
+  }
+  stops = out;
+  stopById.clear();
+  for (const s of stops) stopById.set(String(s.id), s);
+  setStatus(""); // ready
+}
+
+function searchStopsLocal(q, limit = 25) {
+  const n = q.trim().toLowerCase();
+  if (n.length < 2) return [];
+  // Very lightweight: startsWith gets priority, then contains
+  const starts = [];
+  const contains = [];
+  for (const s of stops) {
+    const name = s.name.toLowerCase();
+    if (name.startsWith(n)) starts.push(s);
+    else if (name.includes(n)) contains.push(s);
+    if (starts.length >= limit) break;
+  }
+  return (starts.concat(contains)).slice(0, limit);
+}
+
+function resolveStopLocal(id, name) {
+  if (id && stopById.has(String(id))) return stopById.get(String(id));
+  if (name) {
+    const n = name.toLowerCase();
+    // exact name match first
+    let found = stops.find(s => s.name.toLowerCase() === n);
+    if (!found) found = stops.find(s => s.name.toLowerCase().includes(n));
+    return found || null;
+  }
+  return null;
+}
 
 // --- Leaflet map setup + layers ---
 let map;
@@ -53,7 +122,6 @@ function hhmm(totalMin) {
 }
 function clearElement(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function setStatus(msg) { statusEl.textContent = msg || ""; }
-
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
@@ -65,30 +133,6 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 45000) {
   } finally {
     clearTimeout(t);
   }
-}
-
-// Wake loop for cold starts: try /health with backoff up to ~60s total
-async function wakeBackend() {
-  const attempts = [0, 1000, 2000, 4000, 8000, 12000, 16000, 20000]; // cumulative ~63s
-  for (let i = 0; i < attempts.length; i++) {
-    if (i > 0) {
-      setStatus(`Waking backend… (attempt ${i + 1}/${attempts.length})`);
-      await sleep(attempts[i]);
-    } else {
-      setStatus("Waking backend…");
-    }
-    try {
-      const res = await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 45000);
-      if (res.ok) {
-        setStatus(""); // awake
-        return true;
-      }
-    } catch (_) {
-      // continue loop
-    }
-  }
-  setStatus("Backend still sleeping or unreachable.");
-  return false;
 }
 
 // Marker helper
@@ -122,29 +166,7 @@ function fitToContent() {
   if (bounds) map.fitBounds(bounds.pad(0.2));
 }
 
-// Resolve stop coords via /api/stops
-async function resolveStop(id, name) {
-  if (id && stopCache.has(String(id))) return stopCache.get(String(id));
-  const url = `${API_BASE}/api/stops?q=${encodeURIComponent(name || "")}`;
-  const res = await fetchWithTimeout(url, { cache: "no-store" }, 45000);
-  if (!res.ok) throw new Error("stop lookup failed");
-  const arr = await res.json();
-  let found = null;
-  if (id) found = arr.find(s => String(s.id) === String(id));
-  if (!found && name) {
-    const n = (name || "").toLowerCase();
-    found = arr.find(s => (s.name || "").toLowerCase() === n) || arr[0];
-  } else if (!found) {
-    found = arr[0];
-  }
-  if (found) {
-    stopCache.set(String(found.id), found);
-    return found;
-  }
-  throw new Error("stop not found");
-}
-
-// --- Stop suggestions (debounced, with wake + retry) ---
+// --- Stop suggestions (client-side, debounced) ---
 let fromTimer = 0, toTimer = 0;
 
 fromQ.addEventListener("input", () => {
@@ -153,14 +175,24 @@ fromQ.addEventListener("input", () => {
   if (fromTimer) clearTimeout(fromTimer);
   const q = fromQ.value.trim();
   if (!q) return;
-  fromTimer = setTimeout(() => doSearchStops(q, fromList, (s) => {
-    fromId = s.id; fromName = s.name; fromQ.value = s.name;
-    fromLat = s.lat; fromLon = s.lon;
-    stopCache.set(String(s.id), s);
+  fromTimer = setTimeout(() => {
+    const items = searchStopsLocal(q);
     clearElement(fromList);
-    setMarker("from", s.lat, s.lon, `From: ${s.name}`);
-    fitToContent();
-  }), 250);
+    for (const s of items) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.textContent = `${s.name}  ·  ${s.id}`;
+      btn.addEventListener("click", () => {
+        fromId = s.id; fromName = s.name; fromQ.value = s.name;
+        fromLat = s.lat; fromLon = s.lon;
+        clearElement(fromList);
+        setMarker("from", s.lat, s.lon, `From: ${s.name}`);
+        fitToContent();
+      });
+      li.appendChild(btn);
+      fromList.appendChild(li);
+    }
+  }, 200);
 });
 
 toQ.addEventListener("input", () => {
@@ -169,49 +201,25 @@ toQ.addEventListener("input", () => {
   if (toTimer) clearTimeout(toTimer);
   const q = toQ.value.trim();
   if (!q) return;
-  toTimer = setTimeout(() => doSearchStops(q, toList, (s) => {
-    toId = s.id; toName = s.name; toQ.value = s.name;
-    toLat = s.lat; toLon = s.lon;
-    stopCache.set(String(s.id), s);
+  toTimer = setTimeout(() => {
+    const items = searchStopsLocal(q);
     clearElement(toList);
-    setMarker("to", s.lat, s.lon, `To: ${s.name}`);
-    fitToContent();
-  }), 250);
+    for (const s of items) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.textContent = `${s.name}  ·  ${s.id}`;
+      btn.addEventListener("click", () => {
+        toId = s.id; toName = s.name; toQ.value = s.name;
+        toLat = s.lat; toLon = s.lon;
+        clearElement(toList);
+        setMarker("to", s.lat, s.lon, `To: ${s.name}`);
+        fitToContent();
+      });
+      li.appendChild(btn);
+      toList.appendChild(li);
+    }
+  }, 200);
 });
-
-async function doSearchStops(query, listEl, onPick) {
-  setStatus("Searching stops…");
-  // Make sure backend is awake first
-  await wakeBackend();
-
-  const url = `${API_BASE}/api/stops?q=${encodeURIComponent(query)}`;
-  const backoffs = [0, 800, 1600, 3200]; // up to ~5.6s extra
-  for (let i = 0; i < backoffs.length; i++) {
-    if (i > 0) {
-      setStatus(`Searching stops… (retry ${i + 1}/${backoffs.length})`);
-      await sleep(backoffs[i]);
-    }
-    try {
-      const res = await fetchWithTimeout(url, { cache: "no-store" }, 45000);
-      if (!res.ok) throw new Error(`Stop search failed (${res.status})`);
-      const items = await res.json();
-      clearElement(listEl);
-      for (const s of items) {
-        const li = document.createElement("li");
-        const btn = document.createElement("button");
-        btn.textContent = `${s.name}  ·  ${s.id}`;
-        btn.addEventListener("click", () => onPick(s));
-        li.appendChild(btn);
-        listEl.appendChild(li);
-      }
-      setStatus(items.length ? "" : "No stops found.");
-      return;
-    } catch (err) {
-      // loop and retry
-    }
-  }
-  setStatus("Error searching stops (backend slow/unreachable).");
-}
 
 // --- Swap ---
 swapBtn.addEventListener("click", () => {
@@ -227,7 +235,7 @@ swapBtn.addEventListener("click", () => {
   fitToContent();
 });
 
-// --- Route + draw (wake + retries) ---
+// --- Route + draw ---
 goBtn.addEventListener("click", async () => {
   setStatus("");
   clearElement(legsEl);
@@ -236,7 +244,15 @@ goBtn.addEventListener("click", async () => {
   if (!fromId && !fromQ.value.trim()) return setStatus("Pick a 'From' stop.");
   if (!toId && !toQ.value.trim())     return setStatus("Pick a 'To' stop.");
 
-  await wakeBackend();
+  // Fill in IDs/names from local DB if missing
+  if (!fromId && fromQ.value) {
+    const s = resolveStopLocal(null, fromQ.value);
+    if (s) { fromId = s.id; fromName = s.name; fromLat = s.lat; fromLon = s.lon; }
+  }
+  if (!toId && toQ.value) {
+    const s = resolveStopLocal(null, toQ.value);
+    if (s) { toId = s.id; toName = s.name; toLat = s.lat; toLon = s.lon; }
+  }
 
   const body = {
     fromId: fromId || undefined,
@@ -246,7 +262,8 @@ goBtn.addEventListener("click", async () => {
     depart: depart.value || "08:00"
   };
 
-  const backoffs = [0, 1000, 2000, 4000]; // a couple of retries
+  // Be patient with Render cold start
+  const backoffs = [0, 1500, 3000, 6000, 12000];
   for (let i = 0; i < backoffs.length; i++) {
     if (i > 0) {
       setStatus(`Finding route… (retry ${i + 1}/${backoffs.length})`);
@@ -283,16 +300,20 @@ goBtn.addEventListener("click", async () => {
         legsEl.appendChild(card);
       }
 
+      // draw leg lines using local coords
       for (const leg of legs) {
-        const a = await resolveStop(leg.fromId, leg.fromName);
-        const b = await resolveStop(leg.toId, leg.toName);
-        L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
+        const a = resolveStopLocal(leg.fromId, leg.fromName);
+        const b = resolveStopLocal(leg.toId, leg.toName);
+        if (a && b) {
+          L.polyline([[a.lat, a.lon], [b.lat, b.lon]], { weight: 4, opacity: 0.9 }).addTo(routeLayer);
+        }
       }
 
+      // ensure endpoint markers
       const first = legs[0];
       const last  = legs[legs.length - 1];
-      const a0 = await resolveStop(first.fromId, first.fromName);
-      const bN = await resolveStop(last.toId, last.toName);
+      const a0 = resolveStopLocal(first.fromId, first.fromName);
+      const bN = resolveStopLocal(last.toId, last.toName);
       if (a0) { fromLat = a0.lat; fromLon = a0.lon; fromName = a0.name; fromId = String(a0.id); setMarker("from", a0.lat, a0.lon, `From: ${a0.name}`); }
       if (bN) { toLat   = bN.lat; toLon   = bN.lon; toName = bN.name; toId   = String(bN.id);   setMarker("to", bN.lat, bN.lon, `To: ${bN.name}`); }
 
@@ -300,19 +321,11 @@ goBtn.addEventListener("click", async () => {
       setStatus("");
       return;
     } catch (e) {
-      // continue loop
+      // retry loop
     }
   }
   setStatus("Error finding route (backend slow/unreachable).");
 });
 
-// Health check on load (no-cache) with patient timeout
-(async () => {
-  try {
-    const res = await fetchWithTimeout(`${API_BASE}/health`, { cache: "no-store" }, 45000);
-    if (!res.ok) throw new Error("Backend not reachable");
-  } catch (e) {
-    // Leave a helpful message for the user
-    setStatus("Backend not reachable at " + API_BASE + " (" + (e?.message || "network error") + ")");
-  }
-})();
+// Load stops on startup, then we’re ready
+loadStopsCsv().catch(err => setStatus("Failed to load stations: " + err.message));
