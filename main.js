@@ -224,7 +224,7 @@ function extractShapes(routeJson) {
 async function wakeBackend() {
   if (!bootOverlay) return;
 
-  const phrases = ["Waking the server…", "Almost there…", "Render free plan can take ~1 minute on first request…"];
+  const phrases = ["Waking the back-end server...", "Almost there…", "It's worth the wait...", "Who's there?"];
   let i = 0;
   const ticker = setInterval(() => { bootMsg.textContent = phrases[i++ % phrases.length]; }, 2000);
 
