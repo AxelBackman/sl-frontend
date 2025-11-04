@@ -1,5 +1,5 @@
 // --- API base detection ---
-const PROD_API = "https://sl-backend-zbny.onrender.com"; 
+const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change if your prod URL differs
 const LOCAL_DEV_API = "http://localhost:8081";
 export const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
@@ -17,10 +17,13 @@ const statusEl = document.getElementById("status");
 const bootOverlay = document.getElementById("bootOverlay");
 const bootMsg     = document.getElementById("bootMsg");
 
-// --- Globals (no CSV anymore) ---
+// --- Globals ---
 let fromSel = null;      // { id,name,lat?,lon? }
 let toSel   = null;      // { id,name,lat?,lon? }
 let map, fromMarker, toMarker, routeLayer;
+
+// Will be filled after discovery
+let ROUTE_CALL = null; // async (query) => json
 
 // --- Utilities ---
 function setStatus(msg) { statusEl.textContent = msg || ""; }
@@ -44,21 +47,24 @@ function debounce(fn, delay = 200) {
   };
 }
 
+function takeSnippet(text, n = 180) {
+  if (!text) return "";
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > n ? clean.slice(0, n) + "…" : clean;
+}
+
 // --- Stops API (autocomplete) ---
-// We don't know your exact endpoint name; try a few common ones so it "just works".
 async function queryStops(q, { signal } = {}) {
   const endpoints = [
     `${API_BASE}/api/stops?q=${encodeURIComponent(q)}`,
     `${API_BASE}/api/stops/search?q=${encodeURIComponent(q)}`,
     `${API_BASE}/api/suggest?q=${encodeURIComponent(q)}`
   ];
-
   for (const url of endpoints) {
     try {
       const res = await fetch(url, { signal });
       if (!res.ok) continue;
       const data = await res.json();
-      // Normalize into {id,name,lat?,lon?}[]
       const list = Array.isArray(data) ? data : (data.results || data.stops || []);
       return list.map(it => ({
         id: it.id ?? it.stop_id ?? it.siteId ?? it.site_id ?? it.number ?? it.Name ?? it.name,
@@ -66,9 +72,7 @@ async function queryStops(q, { signal } = {}) {
         lat: it.lat ?? it.stop_lat ?? it.y ?? it.Latitude ?? it.latitude,
         lon: it.lon ?? it.stop_lon ?? it.x ?? it.Longitude ?? it.longitude
       })).filter(s => s.id && s.name);
-    } catch (_) {
-      // try next
-    }
+    } catch (_) {}
   }
   return [];
 }
@@ -95,21 +99,14 @@ function renderSuggest(listEl, items, onPick) {
 
 function bindAutocomplete(inputEl, listEl, setSel, markerKey) {
   let inflight = null;
-
   const runSearch = async () => {
     const q = inputEl.value.trim();
-    setSel(null); // reset selection when typing
-    if (!q) {
-      listEl.hidden = true;
-      return;
-    }
-    // abort previous
+    setSel(null);
+    if (!q) { listEl.hidden = true; return; }
     if (inflight) inflight.abort();
     inflight = new AbortController();
-
     listEl.hidden = false;
     listEl.innerHTML = `<li class="hint">Searching…</li>`;
-
     try {
       const items = await queryStops(q, { signal: inflight.signal });
       renderSuggest(listEl, items, (s) => {
@@ -120,20 +117,16 @@ function bindAutocomplete(inputEl, listEl, setSel, markerKey) {
           setMarker(markerKey, s.lat, s.lon, `${markerKey === "from" ? "From" : "To"}: ${s.name}`);
           fitToContent();
         } else {
-          // If the suggestion lacks coordinates, clear marker; route call can still use IDs.
           if (markerKey === "from") clearMarker("from"); else clearMarker("to");
         }
       });
-    } catch (e) {
+    } catch (_) {
       listEl.innerHTML = `<li class="hint">Error searching stops</li>`;
     }
   };
-
-  const debounced = debounce(runSearch, 150); // snappy: triggers well even for single letters like "k"
+  const debounced = debounce(runSearch, 150);
   inputEl.addEventListener("input", debounced);
-  inputEl.addEventListener("focus", () => {
-    if (inputEl.value) debounced();
-  });
+  inputEl.addEventListener("focus", () => { if (inputEl.value) debounced(); });
   document.addEventListener("click", (e) => {
     if (!listEl.contains(e.target) && e.target !== inputEl) listEl.hidden = true;
   });
@@ -211,11 +204,9 @@ function renderLegs(legs = [], summary = "") {
     wrap.appendChild(div);
   }
 }
-
 function extractShapes(routeJson) {
   const shapes = [];
   const legs   = [];
-
   if (Array.isArray(routeJson.legs)) {
     for (const leg of routeJson.legs) {
       let coords = [];
@@ -268,10 +259,8 @@ async function wakeBackend() {
         headers: { "Content-Type": "application/json", "X-Warmup": "1" },
         body: JSON.stringify({ warmup: true })
       }, timeouts[i]);
-
-      // Any HTTP response means the server is awake.
-      break;
-    } catch (e) {
+      break; // any response means container is up
+    } catch (_) {
       const triesLeft = attempts - i - 1;
       if (triesLeft > 0) {
         bootMsg.textContent = `Waking the server… retrying (${triesLeft} left)`;
@@ -280,7 +269,7 @@ async function wakeBackend() {
       } else {
         clearInterval(ticker);
         bootMsg.textContent = "Server didn’t respond. Please refresh or try again shortly.";
-        return; // Keep overlay on, block a broken UI
+        return;
       }
     }
   }
@@ -290,21 +279,144 @@ async function wakeBackend() {
   setTimeout(() => bootOverlay.remove(), 350);
 }
 
+// --- Route endpoint discovery ---
+async function discoverRouteEndpoint() {
+  // candidates: [method, urlBuilder]
+  const PATHS = ["/api/route", "/route", "/api/v1/route", "/v1/route", "/routes"];
+  const candidates = [];
+
+  for (const p of PATHS) {
+    // POST JSON
+    candidates.push({
+      name: `POST ${p} (ids)`,
+      call: async (q) => {
+        const bodyA = {
+          from: { id: q.fromId ?? null, name: q.fromName ?? null, lat: q.fromLat ?? null, lon: q.fromLon ?? null },
+          to:   { id: q.toId ?? null,   name: q.toName ?? null,   lat: q.toLat ?? null,   lon: q.toLon ?? null   },
+          departIso: q.departIso
+        };
+        const res = await fetchWithTimeout(`${API_BASE}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bodyA)
+        }, 25000);
+        return res;
+      }
+    });
+    // POST minimal ids
+    candidates.push({
+      name: `POST ${p} (fromId/toId)`,
+      call: async (q) => {
+        const bodyB = { fromId: q.fromId, toId: q.toId, departIso: q.departIso };
+        const res = await fetchWithTimeout(`${API_BASE}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bodyB)
+        }, 25000);
+        return res;
+      }
+    });
+    // GET ids
+    candidates.push({
+      name: `GET ${p} (ids)`,
+      call: async (q) => {
+        const url = new URL(`${API_BASE}${p}`);
+        if (q.fromId) url.searchParams.set("fromId", q.fromId);
+        if (q.toId)   url.searchParams.set("toId",   q.toId);
+        url.searchParams.set("departIso", q.departIso);
+        const res = await fetchWithTimeout(url.toString(), {}, 25000);
+        return res;
+      }
+    });
+    // GET coords
+    candidates.push({
+      name: `GET ${p} (coords)`,
+      call: async (q) => {
+        const url = new URL(`${API_BASE}${p}`);
+        if (q.fromLat != null && q.fromLon != null) {
+          url.searchParams.set("fromLat", q.fromLat);
+          url.searchParams.set("fromLon", q.fromLon);
+        }
+        if (q.toLat != null && q.toLon != null) {
+          url.searchParams.set("toLat", q.toLat);
+          url.searchParams.set("toLon", q.toLon);
+        }
+        url.searchParams.set("departIso", q.departIso);
+        const res = await fetchWithTimeout(url.toString(), {}, 25000);
+        return res;
+      }
+    });
+  }
+
+  // Build a sample query from current selections (fallback to rough center if not set)
+  const sample = {
+    fromId: fromSel?.id ?? null,
+    toId:   toSel?.id   ?? null,
+    fromName: (fromSel?.name ?? fromQ.value.trim()) || "T-Centralen",
+    toName:   (toSel?.name   ?? toQ.value.trim())   || "Slussen",
+    fromLat: fromSel?.lat ?? 59.330,
+    fromLon: fromSel?.lon ?? 18.060,
+    toLat:   toSel?.lat   ?? 59.319,
+    toLon:   toSel?.lon   ?? 18.073,
+    departIso: (new Date()).toISOString()
+  };
+
+  // We just need to know which one returns a 2xx with JSON.
+  for (const c of candidates) {
+    try {
+      const res = await c.call(sample);
+      const text = await res.text();
+      // If the endpoint exists but we sent wrong shape, it might return 4xx with JSON. Try to parse anyway.
+      let json = {};
+      try { json = JSON.parse(text); } catch {}
+      // Heuristic: success if 2xx and it's an object that looks like a route (has legs or geometry)
+      const looksRoute = json && (Array.isArray(json.legs) || (json.geometry && json.geometry.type));
+      if (res.ok && looksRoute) {
+        ROUTE_CALL = async (query) => {
+          const good = await c.call(query);
+          const t = await good.text();
+          try { return JSON.parse(t); } catch { throw new Error("Route endpoint returned non-JSON"); }
+        };
+        console.log("Route endpoint selected:", c.name);
+        return;
+      }
+      // If 405/404, move on quickly. If 400 with JSON that looks like validation, still move on.
+    } catch (e) {
+      // Continue trying
+    }
+  }
+
+  // Final fallback: keep the original POST /api/route signature
+  ROUTE_CALL = async (q) => {
+    const res = await fetchWithTimeout(`${API_BASE}/api/route`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        from: { id: q.fromId ?? null, name: q.fromName ?? null, lat: q.fromLat ?? null, lon: q.fromLon ?? null },
+        to:   { id: q.toId ?? null,   name: q.toName ?? null,   lat: q.toLat ?? null,   lon: q.toLon ?? null   },
+        departIso: q.departIso
+      })
+    }, 25000);
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`Fallback POST /api/route failed: ${res.status} ${takeSnippet(text)}`);
+    }
+    try { return JSON.parse(text); } catch { throw new Error("Route endpoint returned non-JSON"); }
+  };
+  console.warn("Using fallback route call (POST /api/route).");
+}
+
 // --- Route action ---
 async function findRoute() {
   if (!fromQ.value.trim() || !toQ.value.trim()) {
     setStatus("Pick both 'From' and 'To' stops.");
     return;
   }
-  if (!fromSel || !toSel) {
-    setStatus("Tip: choose from the dropdown so we can use correct stop IDs.");
-    // We’ll still proceed using just names; backend may resolve them.
-  }
 
   clearRoute();
   setStatus("Finding route…");
 
-  // quick mini overlay (in case backend went cold again)
+  // mini overlay
   const blocker = document.createElement("div");
   blocker.style.position = "fixed";
   blocker.style.inset = "0";
@@ -315,54 +427,38 @@ async function findRoute() {
 
   try {
     const when = depart.value ? new Date(depart.value) : new Date();
-    const body = {
-      // Send IDs + names; include lat/lon only if we have them.
-      from: {
-        id: fromSel?.id ?? null,
-        name: fromSel?.name ?? fromQ.value.trim(),
-        lat: fromSel?.lat ?? null,
-        lon: fromSel?.lon ?? null
-      },
-      to: {
-        id: toSel?.id ?? null,
-        name: toSel?.name ?? toQ.value.trim(),
-        lat: toSel?.lat ?? null,
-        lon: toSel?.lon ?? null
-      },
+    const query = {
+      fromId: fromSel?.id ?? null,
+      toId:   toSel?.id   ?? null,
+      fromName: fromSel?.name ?? fromQ.value.trim(),
+      toName:   toSel?.name   ?? toQ.value.trim(),
+      fromLat: fromSel?.lat ?? null,
+      fromLon: fromSel?.lon ?? null,
+      toLat:   toSel?.lat   ?? null,
+      toLon:   toSel?.lon   ?? null,
       departIso: when.toISOString()
     };
 
-    let lastErr = null;
-    for (let i = 0; i < 3; i++) {
+    let json, lastErr;
+    for (let i = 0; i < 2; i++) {
       try {
-        const res = await fetchWithTimeout(`${API_BASE}/api/route`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        }, 20000);
-
-        const text = await res.text();
-        let json = {};
-        try { json = JSON.parse(text); } catch {}
-
-        if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
-
-        const { shapes, legs } = extractShapes(json);
-        for (const shape of shapes) addPolyline(shape);
-        renderLegs(legs, json.summary || "");
-        fitToContent();
-        setStatus("Done.");
-        return;
+        json = await ROUTE_CALL(query);
+        break;
       } catch (e) {
         lastErr = e;
-        setStatus(`Retrying… (${i + 1}/3)`);
-        await sleep(500 + i * 500);
+        await sleep(600);
       }
     }
-    throw lastErr || new Error("Unknown error");
+    if (!json && lastErr) throw lastErr;
+
+    const { shapes, legs } = extractShapes(json);
+    for (const shape of shapes) addPolyline(shape);
+    renderLegs(legs, json.summary || "");
+    fitToContent();
+    setStatus("Done.");
   } catch (e) {
     console.error(e);
-    setStatus("Error finding route (backend slow/unreachable).");
+    setStatus(`Error finding route: ${e.message || "backend unreachable"}`);
   } finally {
     blocker.remove();
   }
@@ -370,10 +466,8 @@ async function findRoute() {
 
 // --- Wire up UI ---
 swapBtn.addEventListener("click", () => {
-  // swap selections + inputs
   [fromSel, toSel] = [toSel, fromSel];
   [fromQ.value, toQ.value] = [toQ.value, fromQ.value];
-  // swap markers
   const a = fromMarker ? fromMarker.getLatLng() : null;
   const b = toMarker ? toMarker.getLatLng() : null;
   clearMarker("from"); clearMarker("to");
@@ -400,6 +494,7 @@ bindAutocomplete(toQ,   toList,   s => (toSel   = s), "to");
 // Init map and boot
 initMap();
 (async function boot() {
-  await wakeBackend(); // blocks UI until backend is awake
+  await wakeBackend();     // block until container is warm
+  await discoverRouteEndpoint(); // auto-select a working route path+method
   setStatus("Ready.");
 })();
