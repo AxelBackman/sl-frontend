@@ -147,54 +147,78 @@ function addPolyline(latlngs) {
   try { const line = L.polyline(latlngs, { weight: 5, opacity: 0.9 }); routeLayer.addLayer(line); return line; }
   catch { return null; }
 }
+
+function mmToHHMM(mins) {
+  if (!Number.isFinite(mins)) return "";
+  const m = ((mins % (24*60)) + (24*60)) % (24*60); // wrap and keep positive
+  const hh = String(Math.floor(m / 60)).padStart(2, "0");
+  const mm = String(m % 60).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
 function renderLegs(legs = [], summary = "") {
   const wrap = document.getElementById("legs");
   wrap.innerHTML = "";
+
   if (summary) {
     const p = document.createElement("p");
     p.style.margin = "0 0 8px";
     p.textContent = summary;
     wrap.appendChild(p);
   }
+
   for (const leg of legs) {
     const div = document.createElement("div");
     div.className = "leg";
+
+    // Title line shows times + endpoints
     const title = document.createElement("h3");
-    title.textContent = `${leg.mode || "Leg"} · ${leg.fromName || ""} → ${leg.toName || ""}`;
+    const depStr = mmToHHMM(leg.depMin);
+    const arrStr = mmToHHMM(leg.arrMin);
+    title.textContent =
+      `${depStr ? depStr + " " : ""}${leg.fromName || ""} → ${arrStr ? arrStr + " " : ""}${leg.toName || ""}`;
+
+    // Body shows line/headsign, trip, duration
     const body = document.createElement("p");
-    const mins = leg.durationMin != null ? `${leg.durationMin} min` : "";
-    const dist = leg.distanceM != null ? ` · ${Math.round(leg.distanceM)} m` : "";
-    body.textContent = [mins, dist].filter(Boolean).join("");
+    const bits = [];
+    if (leg.headsign) bits.push(leg.headsign);
+    if (leg.trip)     bits.push(`Trip ${leg.trip}`);
+    if (Number.isFinite(leg.durationMin)) bits.push(`${leg.durationMin} min`);
+    body.textContent = bits.join(" · ");
+
     div.append(title, body);
     wrap.appendChild(div);
   }
 }
+
+
 function extractShapes(routeJson) {
-  const shapes = [];
+  const shapes = [];                 // your backend doesn't return polylines yet
   const legs   = [];
+
   if (Array.isArray(routeJson.legs)) {
     for (const leg of routeJson.legs) {
-      let coords = [];
-      if (Array.isArray(leg.geometry)) {
-        coords = leg.geometry.map(([lat, lon]) => [lat, lon]);
-      } else if (leg.geometry && leg.geometry.type === "LineString" && Array.isArray(leg.geometry.coordinates)) {
-        coords = leg.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
-      }
-      if (coords.length) shapes.push(coords);
+      // leg: { trip, fromId, toId, dep, arr, fromName, toName, headsign }
+      const depMin = Number(leg.dep);
+      const arrMin = Number(leg.arr);
       legs.push({
-        mode: leg.mode,
-        fromName: leg.fromName || leg.from || "",
-        toName: leg.toName || leg.to || "",
-        durationMin: leg.durationMin ?? null,
-        distanceM: leg.distanceM ?? null
+        // keep old keys so renderLegs works, but enrich them
+        mode: leg.headsign || "Ride",
+        fromName: leg.fromName || "",
+        toName: leg.toName || "",
+        durationMin: Number.isFinite(depMin) && Number.isFinite(arrMin) ? (arrMin - depMin) : null,
+
+        // new fields used by the renderer below
+        depMin,
+        arrMin,
+        headsign: leg.headsign || null,
+        trip: leg.trip || null,
       });
     }
-  } else if (routeJson.geometry && routeJson.geometry.type === "LineString") {
-    const coords = routeJson.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
-    if (coords.length) shapes.push(coords);
   }
   return { shapes, legs };
 }
+
 
 // --- Backend warmup (use /health) ---
 async function wakeBackend() {
@@ -272,7 +296,12 @@ async function findRoute() {
 
     const { shapes, legs } = extractShapes(json);
     for (const shape of shapes) addPolyline(shape);
-    renderLegs(legs, json.summary || "");
+    const parts = [];
+    if (Number.isFinite(json.total))      parts.push(`Total ${json.total} min`);
+    if (Number.isFinite(json.transfers))  parts.push(`${json.transfers} transfer${json.transfers === 1 ? "" : "s"}`);
+    const summary = parts.join(" · ");
+
+    renderLegs(legs, summary);
     fitToContent();
     setStatus("Done.");
   } catch (e) {
