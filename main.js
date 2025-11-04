@@ -195,16 +195,15 @@ function renderLegs(legs = [], summary = "") {
 
 // --- Backend returns no polylines yet; we enrich legs and build geometry ourselves
 function extractShapes(routeJson) {
-  const shapes = [];  // backend doesn't return polylines yet
+  const shapes = [];  // backend doesn't return polyline shapes (yet)
   const legs   = [];
 
   if (Array.isArray(routeJson.legs)) {
     for (const leg of routeJson.legs) {
-      // leg: { trip, fromId, toId, dep, arr, fromName, toName, headsign }
       const depMin = Number(leg.dep);
       const arrMin = Number(leg.arr);
       legs.push({
-        // existing fields used by renderLegs
+        // fields used by renderer
         mode: leg.headsign || "Ride",
         fromName: leg.fromName || "",
         toName: leg.toName || "",
@@ -216,9 +215,10 @@ function extractShapes(routeJson) {
         headsign: leg.headsign || null,
         trip: leg.trip || null,
 
-        // IDs to let us look up coordinates
+        // ids & hops for geometry
         fromId: leg.fromId ?? null,
-        toId:   leg.toId   ?? null
+        toId:   leg.toId   ?? null,
+        hops:   Array.isArray(leg.hops) ? leg.hops : null
       });
     }
   }
@@ -226,13 +226,11 @@ function extractShapes(routeJson) {
 }
 
 /* ============================
-   Route geometry helpers (NEW)
+   Route geometry helpers (fallback)
    ============================ */
 
 // Cache stops so we don’t re-fetch the same ones
 const stopCache = new Map(); // key -> { id,name,lat,lon }
-
-// put stop in cache by id and by name
 function putStopInCache(s) {
   if (!s) return;
   if (s.id != null) stopCache.set(String(s.id), s);
@@ -247,7 +245,6 @@ async function lookupStop(keyId, nameFallback) {
   if (kId && stopCache.has(kId)) return stopCache.get(kId);
   if (kName && stopCache.has(kName)) return stopCache.get(kName);
 
-  // 1) by id
   if (kId) {
     try {
       const items = await queryStops(kId);
@@ -259,7 +256,6 @@ async function lookupStop(keyId, nameFallback) {
     } catch {}
   }
 
-  // 2) by name
   if (nameFallback) {
     try {
       const items = await queryStops(nameFallback);
@@ -295,7 +291,7 @@ async function legsToGeometry(legs = []) {
     }
   }
 
-  // de-dupe nodes by id (or name as fallback)
+  // de-dupe nodes by id
   const seen = new Set();
   const uniqueNodes = [];
   for (const n of nodes) {
@@ -308,7 +304,6 @@ async function legsToGeometry(legs = []) {
   return { segments, nodes: uniqueNodes };
 }
 
-// Render small circle markers for each stop in the route
 function addStopMarkers(nodes = []) {
   for (const n of nodes) {
     if (Number.isFinite(n.lat) && Number.isFinite(n.lon)) {
@@ -396,13 +391,12 @@ async function findRoute() {
     try { json = JSON.parse(text); } catch {}
 
     if (!res.ok) {
-      // backend returns 404 with { ok:false } for no route
       throw new Error(`${res.status} ${text ? text.slice(0,160) : ""}`);
     }
 
     const { shapes, legs } = extractShapes(json);
 
-    // Prefer backend shapes if ever provided; otherwise build from legs
+    // 1) Prefer backend-provided shapes (future-proof)
     let drewAnything = false;
     if (Array.isArray(shapes) && shapes.length) {
       for (const shape of shapes) {
@@ -410,10 +404,35 @@ async function findRoute() {
       }
     }
 
+    // 2) Next, prefer hops (each leg carries every station with lat/lon)
     if (!drewAnything) {
-      const { segments, nodes } = await legsToGeometry(legs);
-      for (const seg of segments) addPolyline(seg);
-      addStopMarkers(nodes);
+      let anyHops = false;
+      for (const leg of legs) {
+        if (Array.isArray(leg.hops) && leg.hops.length >= 2) {
+          anyHops = true;
+          const coords = leg.hops
+            .filter(h => Number.isFinite(h.lat) && Number.isFinite(h.lon))
+            .map(h => [h.lat, h.lon]);
+          addPolyline(coords);
+
+          // markers for each hop
+          for (const h of leg.hops) {
+            if (Number.isFinite(h.lat) && Number.isFinite(h.lon)) {
+              const m = L.circleMarker([h.lat, h.lon], {
+                radius: 5, weight: 2, fillOpacity: 0.9
+              }).bindTooltip(h.name || "", { direction: "top", offset: [0, -6] });
+              routeLayer.addLayer(m);
+            }
+          }
+        }
+      }
+
+      // 3) Fallback: just connect leg endpoints via /api/stops lookups
+      if (!anyHops) {
+        const { segments, nodes } = await legsToGeometry(legs);
+        for (const seg of segments) addPolyline(seg);
+        addStopMarkers(nodes);
+      }
     }
 
     const parts = [];
