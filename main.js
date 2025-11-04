@@ -1,5 +1,5 @@
 // --- API base detection ---
-const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change to your prod URL
+const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change to your prod URL if different
 const LOCAL_DEV_API = "http://localhost:8081";
 export const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
@@ -8,7 +8,7 @@ const fromQ    = document.getElementById("fromQuery");
 const toQ      = document.getElementById("toQuery");
 const fromList = document.getElementById("fromList");
 const toList   = document.getElementById("toList");
-const depart   = document.getElementById("depart");
+const depart   = document.getElementById("depart"); // type="time"
 const goBtn    = document.getElementById("goBtn");
 const swapBtn  = document.getElementById("swapBtn");
 const statusEl = document.getElementById("status");
@@ -31,15 +31,14 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   try { return await fetch(url, { ...options, signal: ctrl.signal }); }
   finally { clearTimeout(id); }
 }
-function debounce(fn, delay = 200) {
-  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), delay); };
-}
-function takeSnippet(text, n = 160) {
-  if (!text) return ""; const s = text.replace(/\s+/g, " ").trim();
-  return s.length > n ? s.slice(0, n) + "…" : s;
+function debounce(fn, delay = 200) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), delay); }; }
+function nowHHMM() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`; // local time → HH:mm
 }
 
-// --- Stops API (exact to your backend) ---
+// --- Stops API ---
 async function queryStops(q, { signal } = {}) {
   const url = `${API_BASE}/api/stops?q=${encodeURIComponent(q)}`;
   const res = await fetch(url, { signal, mode: "cors" });
@@ -102,7 +101,7 @@ function bindAutocomplete(inputEl, listEl, setSel, markerKey) {
       listEl.innerHTML = `<li class="hint">Error searching stops</li>`;
     }
   };
-  const debounced = debounce(runSearch, 150); // single letters like "k" work nicely
+  const debounced = debounce(runSearch, 150);
   inputEl.addEventListener("input", debounced);
   inputEl.addEventListener("focus", () => { if (inputEl.value) debounced(); });
   document.addEventListener("click", (e) => {
@@ -200,11 +199,8 @@ function extractShapes(routeJson) {
 // --- Backend warmup (use /health) ---
 async function wakeBackend() {
   if (!bootOverlay) return;
-  const phrases = [
-    "Waking the server…",
-    "Almost there…",
-    "Render free plan can take ~1 minute on first request…"
-  ];
+
+  const phrases = ["Waking the server…", "Almost there…", "Render free plan can take ~1 minute on first request…"];
   let i = 0;
   const ticker = setInterval(() => { bootMsg.textContent = phrases[i++ % phrases.length]; }, 2000);
 
@@ -229,7 +225,7 @@ async function wakeBackend() {
   setTimeout(() => bootOverlay.remove(), 350);
 }
 
-// --- Route action (POST /api/route with flat fields) ---
+// --- Route action (POST /api/route with flat fields; depart = "HH:mm") ---
 async function findRoute() {
   if (!fromQ.value.trim() || !toQ.value.trim()) {
     setStatus("Pick both 'From' and 'To' stops.");
@@ -249,11 +245,9 @@ async function findRoute() {
   document.body.appendChild(blocker);
 
   try {
-    const when = depart.value ? new Date(depart.value) : new Date();
-
-    // BACKEND EXPECTS: { depart, fromId, toId, fromName, toName }
+    const chosen = depart.value?.trim() || nowHHMM(); // "HH:mm"
     const body = {
-      depart: when.toISOString(),
+      depart: chosen,
       fromId:  fromSel?.id ?? null,
       toId:    toSel?.id   ?? null,
       fromName: fromSel?.name ?? fromQ.value.trim(),
@@ -272,8 +266,8 @@ async function findRoute() {
     try { json = JSON.parse(text); } catch {}
 
     if (!res.ok) {
-      // Your backend returns 404 with { ok:false } for “no route”
-      throw new Error(`${res.status} ${takeSnippet(json.error || text)}`);
+      // backend returns 404 with { ok:false } for no route
+      throw new Error(`${res.status} ${text ? text.slice(0,160) : ""}`);
     }
 
     const { shapes, legs } = extractShapes(json);
@@ -304,15 +298,12 @@ swapBtn.addEventListener("click", () => {
 });
 goBtn.addEventListener("click", findRoute);
 
-// Default depart time = now (local)
+// Default depart = now (HH:mm local)
 (function initDepartNow(){
-  const now = new Date(); now.setSeconds(0,0);
-  const pad = n => String(n).padStart(2,"0");
-  const local = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  depart.value = local;
+  depart.value = nowHHMM();
 })();
 
-// Autocomplete
+// Autocomplete (backend-powered)
 bindAutocomplete(fromQ, fromList, s => (fromSel = s), "from");
 bindAutocomplete(toQ,   toList,   s => (toSel   = s), "to");
 
