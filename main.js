@@ -1,10 +1,6 @@
 // --- API base detection ---
-// Production API = your Render URL (HTTPS, no trailing slash)
-const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change if needed
-// Local dev API (adjust if your local port differs)
+const PROD_API = "https://sl-backend-zbny.onrender.com"; 
 const LOCAL_DEV_API = "http://localhost:8081";
-
-// Use PROD when hosted on GitHub Pages; otherwise use local
 export const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
 // --- DOM refs ---
@@ -17,14 +13,13 @@ const goBtn    = document.getElementById("goBtn");
 const swapBtn  = document.getElementById("swapBtn");
 const statusEl = document.getElementById("status");
 
-// NEW: overlay refs
+// Overlay
 const bootOverlay = document.getElementById("bootOverlay");
 const bootMsg     = document.getElementById("bootMsg");
 
-// --- Globals ---
-let stops = [];          // {id,name,lat,lon, norm}
-let fromSel = null;      // stop object
-let toSel   = null;      // stop object
+// --- Globals (no CSV anymore) ---
+let fromSel = null;      // { id,name,lat?,lon? }
+let toSel   = null;      // { id,name,lat?,lon? }
 let map, fromMarker, toMarker, routeLayer;
 
 // --- Utilities ---
@@ -41,44 +36,55 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   }
 }
 
-function normalize(s) {
-  return (s || "")
-    .toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
+function debounce(fn, delay = 200) {
+  let t;
+  return (...args) => {
+    clearTimeout(t);
+    t = setTimeout(() => fn(...args), delay);
+  };
 }
 
-function parseCSV(text) {
-  // super-simple CSV (no quoted commas needed for our stops.csv)
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  const [hdr, ...rows] = lines;
-  const idx = {};
-  hdr.split(",").forEach((h, i) => (idx[h.trim()] = i));
-  return rows.map(line => {
-    const cols = line.split(",");
-    const id   = cols[idx.id]?.trim();
-    const name = cols[idx.name]?.trim();
-    const lat  = parseFloat(cols[idx.lat]);
-    const lon  = parseFloat(cols[idx.lon]);
-    return { id, name, lat, lon, norm: normalize(name) };
-  });
+// --- Stops API (autocomplete) ---
+// We don't know your exact endpoint name; try a few common ones so it "just works".
+async function queryStops(q, { signal } = {}) {
+  const endpoints = [
+    `${API_BASE}/api/stops?q=${encodeURIComponent(q)}`,
+    `${API_BASE}/api/stops/search?q=${encodeURIComponent(q)}`,
+    `${API_BASE}/api/suggest?q=${encodeURIComponent(q)}`
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, { signal });
+      if (!res.ok) continue;
+      const data = await res.json();
+      // Normalize into {id,name,lat?,lon?}[]
+      const list = Array.isArray(data) ? data : (data.results || data.stops || []);
+      return list.map(it => ({
+        id: it.id ?? it.stop_id ?? it.siteId ?? it.site_id ?? it.number ?? it.Name ?? it.name,
+        name: it.name ?? it.stop_name ?? it.DisplayName ?? it.displayName ?? it.Name ?? it.description,
+        lat: it.lat ?? it.stop_lat ?? it.y ?? it.Latitude ?? it.latitude,
+        lon: it.lon ?? it.stop_lon ?? it.x ?? it.Longitude ?? it.longitude
+      })).filter(s => s.id && s.name);
+    } catch (_) {
+      // try next
+    }
+  }
+  return [];
 }
 
-// --- Stops + Autocomplete ---
-async function loadStopsCsv() {
-  const res = await fetch("./stops.csv");
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  stops = parseCSV(await res.text());
-}
-
+// --- Suggest UI ---
 function renderSuggest(listEl, items, onPick) {
   listEl.innerHTML = "";
   if (!items.length) {
-    listEl.hidden = true;
+    const li = document.createElement("li");
+    li.className = "hint";
+    li.textContent = "No matches";
+    listEl.appendChild(li);
+    listEl.hidden = false;
     return;
   }
-  for (const s of items.slice(0, 8)) {
+  for (const s of items.slice(0, 12)) {
     const li = document.createElement("li");
     li.textContent = s.name;
     li.addEventListener("click", () => onPick(s));
@@ -88,28 +94,45 @@ function renderSuggest(listEl, items, onPick) {
 }
 
 function bindAutocomplete(inputEl, listEl, setSel, markerKey) {
-  inputEl.addEventListener("input", () => {
-    const q = normalize(inputEl.value);
+  let inflight = null;
+
+  const runSearch = async () => {
+    const q = inputEl.value.trim();
+    setSel(null); // reset selection when typing
     if (!q) {
-      renderSuggest(listEl, [], () => {});
-      setSel(null);
-      if (markerKey === "from") clearMarker("from");
-      if (markerKey === "to") clearMarker("to");
+      listEl.hidden = true;
       return;
     }
-    const matches = stops
-      .filter(s => s.norm.includes(q))
-      .sort((a,b) => a.norm.indexOf(q) - b.norm.indexOf(q));
-    renderSuggest(listEl, matches, (s) => {
-      inputEl.value = s.name;
-      listEl.hidden = true;
-      setSel(s);
-      setMarker(markerKey, s.lat, s.lon, `${markerKey === "from" ? "From" : "To"}: ${s.name}`);
-      fitToContent();
-    });
-  });
+    // abort previous
+    if (inflight) inflight.abort();
+    inflight = new AbortController();
+
+    listEl.hidden = false;
+    listEl.innerHTML = `<li class="hint">Searching…</li>`;
+
+    try {
+      const items = await queryStops(q, { signal: inflight.signal });
+      renderSuggest(listEl, items, (s) => {
+        inputEl.value = s.name;
+        listEl.hidden = true;
+        setSel(s);
+        if (s.lat != null && s.lon != null) {
+          setMarker(markerKey, s.lat, s.lon, `${markerKey === "from" ? "From" : "To"}: ${s.name}`);
+          fitToContent();
+        } else {
+          // If the suggestion lacks coordinates, clear marker; route call can still use IDs.
+          if (markerKey === "from") clearMarker("from"); else clearMarker("to");
+        }
+      });
+    } catch (e) {
+      listEl.innerHTML = `<li class="hint">Error searching stops</li>`;
+    }
+  };
+
+  const debounced = debounce(runSearch, 150); // snappy: triggers well even for single letters like "k"
+  inputEl.addEventListener("input", debounced);
   inputEl.addEventListener("focus", () => {
-    if (inputEl.value) inputEl.dispatchEvent(new Event("input"));
+    if (inputEl.value) debounced();
   });
   document.addEventListener("click", (e) => {
     if (!listEl.contains(e.target) && e.target !== inputEl) listEl.hidden = true;
@@ -122,8 +145,7 @@ function initMap() {
   map = L.map("map", { zoomControl: true }).setView(stockholm, 11);
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     maxZoom: 19,
-    attribution:
-      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
   }).addTo(map);
   routeLayer = L.layerGroup().addTo(map);
 }
@@ -190,18 +212,14 @@ function renderLegs(legs = [], summary = "") {
   }
 }
 
-// Accept multiple possible shapes from the backend
 function extractShapes(routeJson) {
-  // Try common shapes: legs[i].geometry (array of [lat,lon]) or GeoJSON LineString
   const shapes = [];
   const legs   = [];
 
-  // If there's a top-level "legs"
   if (Array.isArray(routeJson.legs)) {
     for (const leg of routeJson.legs) {
       let coords = [];
       if (Array.isArray(leg.geometry)) {
-        // [[lat,lon], ...]
         coords = leg.geometry.map(([lat, lon]) => [lat, lon]);
       } else if (leg.geometry && leg.geometry.type === "LineString" && Array.isArray(leg.geometry.coordinates)) {
         coords = leg.geometry.coordinates.map(([lon, lat]) => [lat, lon]);
@@ -274,16 +292,19 @@ async function wakeBackend() {
 
 // --- Route action ---
 async function findRoute() {
-  if (!fromSel || !toSel) {
+  if (!fromQ.value.trim() || !toQ.value.trim()) {
     setStatus("Pick both 'From' and 'To' stops.");
     return;
+  }
+  if (!fromSel || !toSel) {
+    setStatus("Tip: choose from the dropdown so we can use correct stop IDs.");
+    // We’ll still proceed using just names; backend may resolve them.
   }
 
   clearRoute();
   setStatus("Finding route…");
 
-  // If Render has gone cold again after a long idle period, show a quick mini-blocker
-  // (avoid reusing bootOverlay which we removed)
+  // quick mini overlay (in case backend went cold again)
   const blocker = document.createElement("div");
   blocker.style.position = "fixed";
   blocker.style.inset = "0";
@@ -293,16 +314,24 @@ async function findRoute() {
   document.body.appendChild(blocker);
 
   try {
-    const when = depart.value
-      ? new Date(depart.value)
-      : new Date();
+    const when = depart.value ? new Date(depart.value) : new Date();
     const body = {
-      from: { lat: fromSel.lat, lon: fromSel.lon, id: fromSel.id, name: fromSel.name },
-      to:   { lat: toSel.lat,   lon: toSel.lon,   id: toSel.id,   name: toSel.name   },
+      // Send IDs + names; include lat/lon only if we have them.
+      from: {
+        id: fromSel?.id ?? null,
+        name: fromSel?.name ?? fromQ.value.trim(),
+        lat: fromSel?.lat ?? null,
+        lon: fromSel?.lon ?? null
+      },
+      to: {
+        id: toSel?.id ?? null,
+        name: toSel?.name ?? toQ.value.trim(),
+        lat: toSel?.lat ?? null,
+        lon: toSel?.lon ?? null
+      },
       departIso: when.toISOString()
     };
 
-    // Try a few times to be friendly with free cold starts.
     let lastErr = null;
     for (let i = 0; i < 3; i++) {
       try {
@@ -311,16 +340,13 @@ async function findRoute() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body)
         }, 20000);
+
         const text = await res.text();
-        // Some backends return 4xx with useful JSON—attempt JSON parse either way.
         let json = {};
-        try { json = JSON.parse(text); } catch { /* ignore */ }
+        try { json = JSON.parse(text); } catch {}
 
-        if (!res.ok) {
-          throw new Error(json.error || `HTTP ${res.status}`);
-        }
+        if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
 
-        // Draw
         const { shapes, legs } = extractShapes(json);
         for (const shape of shapes) addPolyline(shape);
         renderLegs(legs, json.summary || "");
@@ -330,7 +356,7 @@ async function findRoute() {
       } catch (e) {
         lastErr = e;
         setStatus(`Retrying… (${i + 1}/3)`);
-        await sleep(1000 + i * 500);
+        await sleep(500 + i * 500);
       }
     }
     throw lastErr || new Error("Unknown error");
@@ -344,7 +370,7 @@ async function findRoute() {
 
 // --- Wire up UI ---
 swapBtn.addEventListener("click", () => {
-  // swap selections and inputs
+  // swap selections + inputs
   [fromSel, toSel] = [toSel, fromSel];
   [fromQ.value, toQ.value] = [toQ.value, fromQ.value];
   // swap markers
@@ -367,22 +393,13 @@ goBtn.addEventListener("click", findRoute);
   depart.value = local;
 })();
 
-// Bind autocomplete
+// Bind autocomplete (backend-powered)
 bindAutocomplete(fromQ, fromList, s => (fromSel = s), "from");
 bindAutocomplete(toQ,   toList,   s => (toSel   = s), "to");
 
-// Init map
+// Init map and boot
 initMap();
-
-// Load stops then wake backend
 (async function boot() {
-  try {
-    setStatus("Loading stops…");
-    await loadStopsCsv();
-    setStatus("Stops loaded.");
-  } catch (err) {
-    console.error(err);
-    setStatus("Failed to load stations: " + err.message);
-  }
   await wakeBackend(); // blocks UI until backend is awake
+  setStatus("Ready.");
 })();
