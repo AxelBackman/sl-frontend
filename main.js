@@ -136,6 +136,8 @@ function fitToContent() {
     if (l.getBounds) {
       const b = l.getBounds();
       if (b.isValid()) bounds.push(b.getNorthWest(), b.getSouthEast());
+    } else if (l.getLatLng) {
+      bounds.push(l.getLatLng());
     }
   });
   if (bounds.length) map.fitBounds(L.latLngBounds(bounds), { padding: [30, 30] });
@@ -191,9 +193,9 @@ function renderLegs(legs = [], summary = "") {
   }
 }
 
-
+// --- Backend returns no polylines yet; we enrich legs and build geometry ourselves
 function extractShapes(routeJson) {
-  const shapes = [];                 // your backend doesn't return polylines yet
+  const shapes = [];  // backend doesn't return polylines yet
   const legs   = [];
 
   if (Array.isArray(routeJson.legs)) {
@@ -202,25 +204,127 @@ function extractShapes(routeJson) {
       const depMin = Number(leg.dep);
       const arrMin = Number(leg.arr);
       legs.push({
-        // keep old keys so renderLegs works, but enrich them
+        // existing fields used by renderLegs
         mode: leg.headsign || "Ride",
         fromName: leg.fromName || "",
         toName: leg.toName || "",
         durationMin: Number.isFinite(depMin) && Number.isFinite(arrMin) ? (arrMin - depMin) : null,
 
-        // new fields used by the renderer below
+        // enriched fields
         depMin,
         arrMin,
         headsign: leg.headsign || null,
         trip: leg.trip || null,
+
+        // IDs to let us look up coordinates
+        fromId: leg.fromId ?? null,
+        toId:   leg.toId   ?? null
       });
     }
   }
   return { shapes, legs };
 }
 
+/* ============================
+   Route geometry helpers (NEW)
+   ============================ */
 
-// --- Backend warmup (use /health) ---
+// Cache stops so we don’t re-fetch the same ones
+const stopCache = new Map(); // key -> { id,name,lat,lon }
+
+// put stop in cache by id and by name
+function putStopInCache(s) {
+  if (!s) return;
+  if (s.id != null) stopCache.set(String(s.id), s);
+  if (s.name) stopCache.set(`name:${s.name.toLowerCase()}`, s);
+}
+
+// Try cache → /api/stops by id → /api/stops by name
+async function lookupStop(keyId, nameFallback) {
+  const kId = keyId != null ? String(keyId) : null;
+  const kName = nameFallback ? `name:${nameFallback.toLowerCase()}` : null;
+
+  if (kId && stopCache.has(kId)) return stopCache.get(kId);
+  if (kName && stopCache.has(kName)) return stopCache.get(kName);
+
+  // 1) by id
+  if (kId) {
+    try {
+      const items = await queryStops(kId);
+      const exact = items?.find(s => String(s.id) === kId);
+      if (exact && Number.isFinite(exact.lat) && Number.isFinite(exact.lon)) {
+        putStopInCache(exact);
+        return exact;
+      }
+    } catch {}
+  }
+
+  // 2) by name
+  if (nameFallback) {
+    try {
+      const items = await queryStops(nameFallback);
+      const exactByName = items?.find(s => (s.name || "").toLowerCase() === nameFallback.toLowerCase());
+      const pick = exactByName || items?.[0];
+      if (pick && Number.isFinite(pick.lat) && Number.isFinite(pick.lon)) {
+        putStopInCache(pick);
+        return pick;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+// Build straight-line segments and a unique list of stop nodes
+async function legsToGeometry(legs = []) {
+  const segments = []; // each: [[lat,lon],[lat,lon]]
+  const nodes = [];    // each: {id,name,lat,lon}
+
+  const pushNode = (s) => {
+    if (!s) return;
+    nodes.push({ id: s.id ?? s.name, name: s.name, lat: s.lat, lon: s.lon });
+  };
+
+  for (const leg of legs) {
+    const from = await lookupStop(leg.fromId, leg.fromName);
+    const to   = await lookupStop(leg.toId,   leg.toName);
+    if (from && to) {
+      segments.push([[from.lat, from.lon], [to.lat, to.lon]]);
+      pushNode(from);
+      pushNode(to);
+    }
+  }
+
+  // de-dupe nodes by id (or name as fallback)
+  const seen = new Set();
+  const uniqueNodes = [];
+  for (const n of nodes) {
+    const k = String(n.id);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniqueNodes.push(n);
+  }
+
+  return { segments, nodes: uniqueNodes };
+}
+
+// Render small circle markers for each stop in the route
+function addStopMarkers(nodes = []) {
+  for (const n of nodes) {
+    if (Number.isFinite(n.lat) && Number.isFinite(n.lon)) {
+      const m = L.circleMarker([n.lat, n.lon], {
+        radius: 5,
+        weight: 2,
+        fillOpacity: 0.9
+      }).bindTooltip(n.name || "", { direction: "top", offset: [0, -6] });
+      routeLayer.addLayer(m);
+    }
+  }
+}
+
+/* ============================
+   Backend warmup (use /health)
+   ============================ */
 async function wakeBackend() {
   if (!bootOverlay) return;
 
@@ -249,7 +353,9 @@ async function wakeBackend() {
   setTimeout(() => bootOverlay.remove(), 350);
 }
 
-// --- Route action (POST /api/route with flat fields; depart = "HH:mm") ---
+/* ==========================================
+   Route action (POST /api/route; depart HH:mm)
+   ========================================== */
 async function findRoute() {
   if (!fromQ.value.trim() || !toQ.value.trim()) {
     setStatus("Pick both 'From' and 'To' stops.");
@@ -295,7 +401,21 @@ async function findRoute() {
     }
 
     const { shapes, legs } = extractShapes(json);
-    for (const shape of shapes) addPolyline(shape);
+
+    // Prefer backend shapes if ever provided; otherwise build from legs
+    let drewAnything = false;
+    if (Array.isArray(shapes) && shapes.length) {
+      for (const shape of shapes) {
+        if (shape && shape.length) { addPolyline(shape); drewAnything = true; }
+      }
+    }
+
+    if (!drewAnything) {
+      const { segments, nodes } = await legsToGeometry(legs);
+      for (const seg of segments) addPolyline(seg);
+      addStopMarkers(nodes);
+    }
+
     const parts = [];
     if (Number.isFinite(json.total))      parts.push(`Total ${json.total} min`);
     if (Number.isFinite(json.transfers))  parts.push(`${json.transfers} transfer${json.transfers === 1 ? "" : "s"}`);
