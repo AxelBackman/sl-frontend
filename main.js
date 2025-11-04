@@ -1,5 +1,5 @@
 // --- API base detection ---
-const PROD_API = "https://YOUR-RENDER-APP.onrender.com"; // <-- CHANGE THIS to your Render URL
+const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change to your prod URL
 const LOCAL_DEV_API = "http://localhost:8081";
 export const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
@@ -25,21 +25,18 @@ let map, fromMarker, toMarker, routeLayer;
 // --- Utils ---
 function setStatus(msg) { statusEl.textContent = msg || ""; }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function takeSnippet(text, n = 180) {
-  if (!text) return ""; const clean = text.replace(/\s+/g, " ").trim();
-  return clean.length > n ? clean.slice(0, n) + "…" : clean;
-}
 async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const ctrl = new AbortController();
   const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
-  } finally {
-    clearTimeout(id);
-  }
+  try { return await fetch(url, { ...options, signal: ctrl.signal }); }
+  finally { clearTimeout(id); }
 }
 function debounce(fn, delay = 200) {
   let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), delay); };
+}
+function takeSnippet(text, n = 160) {
+  if (!text) return ""; const s = text.replace(/\s+/g, " ").trim();
+  return s.length > n ? s.slice(0, n) + "…" : s;
 }
 
 // --- Stops API (exact to your backend) ---
@@ -105,7 +102,7 @@ function bindAutocomplete(inputEl, listEl, setSel, markerKey) {
       listEl.innerHTML = `<li class="hint">Error searching stops</li>`;
     }
   };
-  const debounced = debounce(runSearch, 150);
+  const debounced = debounce(runSearch, 150); // single letters like "k" work nicely
   inputEl.addEventListener("input", debounced);
   inputEl.addEventListener("focus", () => { if (inputEl.value) debounced(); });
   document.addEventListener("click", (e) => {
@@ -208,19 +205,19 @@ async function wakeBackend() {
     "Almost there…",
     "Render free plan can take ~1 minute on first request…"
   ];
-  let phraseIdx = 0;
-  const ticker = setInterval(() => { bootMsg.textContent = phrases[phraseIdx++ % phrases.length]; }, 2000);
+  let i = 0;
+  const ticker = setInterval(() => { bootMsg.textContent = phrases[i++ % phrases.length]; }, 2000);
 
   const attempts = 10;
-  for (let i = 0; i < attempts; i++) {
+  for (let a = 0; a < attempts; a++) {
     try {
       const res = await fetchWithTimeout(`${API_BASE}/health`, { mode: "cors" }, 6000);
       if (res.ok) break;
-    } catch (_) {}
-    const left = attempts - i - 1;
+    } catch {}
+    const left = attempts - a - 1;
     if (left > 0) {
       bootMsg.textContent = `Waking the server… retrying (${left} left)`;
-      await sleep(800 + i * 400);
+      await sleep(800 + a * 400);
     } else {
       clearInterval(ticker);
       bootMsg.textContent = "Server didn’t respond. Please refresh or try again shortly.";
@@ -232,12 +229,13 @@ async function wakeBackend() {
   setTimeout(() => bootOverlay.remove(), 350);
 }
 
-// --- Route action (exact POST /api/route) ---
+// --- Route action (POST /api/route with flat fields) ---
 async function findRoute() {
   if (!fromQ.value.trim() || !toQ.value.trim()) {
     setStatus("Pick both 'From' and 'To' stops.");
     return;
   }
+
   clearRoute();
   setStatus("Finding route…");
 
@@ -252,10 +250,14 @@ async function findRoute() {
 
   try {
     const when = depart.value ? new Date(depart.value) : new Date();
+
+    // BACKEND EXPECTS: { depart, fromId, toId, fromName, toName }
     const body = {
-      from: { id: fromSel?.id ?? null, name: fromSel?.name ?? fromQ.value.trim(), lat: fromSel?.lat ?? null, lon: fromSel?.lon ?? null },
-      to:   { id: toSel?.id ?? null,   name: toSel?.name   ?? toQ.value.trim(),   lat: toSel?.lat   ?? null, lon: toSel?.lon   ?? null },
-      departIso: when.toISOString()
+      depart: when.toISOString(),
+      fromId:  fromSel?.id ?? null,
+      toId:    toSel?.id   ?? null,
+      fromName: fromSel?.name ?? fromQ.value.trim(),
+      toName:   toSel?.name   ?? toQ.value.trim()
     };
 
     const res = await fetchWithTimeout(`${API_BASE}/api/route`, {
@@ -269,7 +271,10 @@ async function findRoute() {
     let json = {};
     try { json = JSON.parse(text); } catch {}
 
-    if (!res.ok) throw new Error(`${res.status} ${takeSnippet(json.error || text)}`);
+    if (!res.ok) {
+      // Your backend returns 404 with { ok:false } for “no route”
+      throw new Error(`${res.status} ${takeSnippet(json.error || text)}`);
+    }
 
     const { shapes, legs } = extractShapes(json);
     for (const shape of shapes) addPolyline(shape);
@@ -277,13 +282,9 @@ async function findRoute() {
     fitToContent();
     setStatus("Done.");
   } catch (e) {
-    // CORS failures throw a TypeError/NetworkError with no status code.
     const likelyCORS = (e instanceof TypeError) || /NetworkError|TypeError/.test(String(e));
-    if (likelyCORS) {
-      setStatus("Error finding route: network/CORS blocked. Check PROD_API and CORS_ORIGIN.");
-    } else {
-      setStatus(`Error finding route: ${e.message || "backend unreachable"}`);
-    }
+    if (likelyCORS) setStatus("Error finding route: network/CORS blocked. Check PROD_API and CORS_ORIGIN.");
+    else setStatus(`Error finding route: ${e.message || "backend unreachable"}`);
     console.error(e);
   } finally {
     blocker.remove();
@@ -318,60 +319,6 @@ bindAutocomplete(toQ,   toList,   s => (toSel   = s), "to");
 // Map + boot
 initMap();
 (async function boot() {
-  await wakeBackend();
+  await wakeBackend(); // wait for /health
   setStatus("Ready.");
-  addDiagnostics(); // <- small helper at the end of file
 })();
-
-// --- tiny diagnostics widget ---
-function addDiagnostics() {
-  const box = document.createElement("div");
-  box.style.position = "fixed";
-  box.style.left = "12px";
-  box.style.bottom = "12px";
-  box.style.background = "rgba(255,255,255,.95)";
-  box.style.border = "1px solid #ddd";
-  box.style.borderRadius = "8px";
-  box.style.padding = "8px 10px";
-  box.style.fontSize = "12px";
-  box.style.zIndex = "999";
-  box.innerHTML = `
-    <div style="font-weight:600;margin-bottom:6px">Diagnostics</div>
-    <div>API_BASE: <code>${API_BASE}</code></div>
-    <button id="diagPing" style="margin-top:6px">Run checks</button>
-    <div id="diagOut" style="margin-top:6px;max-width:300px;white-space:pre-wrap"></div>
-  `;
-  document.body.appendChild(box);
-  document.getElementById("diagPing").addEventListener("click", runChecks);
-  async function runChecks() {
-    const out = document.getElementById("diagOut");
-    out.textContent = "Checking /health…";
-    try {
-      const h = await fetchWithTimeout(`${API_BASE}/health`, { mode: "cors" }, 6000);
-      out.textContent = `/health: ${h.status}\n`;
-    } catch (e) {
-      out.textContent = `/health: network error (${e})\n`;
-    }
-    out.textContent += "Checking /api/stops?q=k…\n";
-    try {
-      const s = await fetchWithTimeout(`${API_BASE}/api/stops?q=k`, { mode: "cors" }, 8000);
-      out.textContent += `/api/stops: ${s.status}\n`;
-    } catch (e) {
-      out.textContent += `/api/stops: network error (${e})\n`;
-    }
-    out.textContent += "Preflighting POST /api/route…\n";
-    try {
-      // NOTE: browsers auto-preflight on POST JSON; we just do the real request with harmless body.
-      const r = await fetchWithTimeout(`${API_BASE}/api/route`, {
-        method: "POST",
-        mode: "cors",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ from:{name:"ping"}, to:{name:"pong"}, departIso:new Date().toISOString() })
-      }, 8000);
-      const text = await r.text();
-      out.textContent += `/api/route: ${r.status} ${takeSnippet(text, 100)}\n`;
-    } catch (e) {
-      out.textContent += `/api/route: network error (likely CORS) ${String(e).slice(0,120)}\n`;
-    }
-  }
-}
