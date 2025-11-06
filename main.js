@@ -1,5 +1,5 @@
 // --- API base detection ---
-const PROD_API = "https://sl-backend-zbny.onrender.com"; // <-- change to your prod URL if different
+const PROD_API = "https://sl-backend-zbny.onrender.com"; 
 const LOCAL_DEV_API = "http://localhost:8081";
 export const API_BASE = location.hostname.endsWith("github.io") ? PROD_API : LOCAL_DEV_API;
 
