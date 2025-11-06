@@ -317,7 +317,7 @@ async function wakeBackend() {
   let i = 0;
   const ticker = setInterval(() => { bootMsg.textContent = phrases[i++ % phrases.length]; }, 2000);
 
-  const attempts = 10;
+  const attempts = 20;
   for (let a = 0; a < attempts; a++) {
     try {
       const res = await fetchWithTimeout(`${API_BASE}/health`, { mode: "cors" }, 6000);
