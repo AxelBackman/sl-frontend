@@ -145,10 +145,14 @@ function fitToContent() {
 
 // --- Route rendering ---
 function clearRoute() { routeLayer.clearLayers(); document.getElementById("legs").innerHTML = ""; }
-function addPolyline(latlngs) {
-  try { const line = L.polyline(latlngs, { weight: 5, opacity: 0.9 }); routeLayer.addLayer(line); return line; }
+function addPolyline(latlngs, color = "#3388ff") {
+  try { const line = L.polyline(latlngs, { color, weight: 5, opacity: 0.9 }); routeLayer.addLayer(line); return line; }
   catch { return null; }
 }
+
+// Generate distinct colors for different legs
+const legColors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#e67e22", "#34495e"];
+function getLegColor(index) { return legColors[index % legColors.length]; }
 
 function mmToHHMM(mins) {
   if (!Number.isFinite(mins)) return "";
@@ -180,12 +184,12 @@ function renderLegs(legs = [], summary = "") {
     title.textContent =
       `${depStr ? depStr + " " : ""}${leg.fromName || ""} → ${arrStr ? arrStr + " " : ""}${leg.toName || ""}`;
 
-    // Body shows line/headsign, trip, duration
+    // Body shows "Mot" + headsign and duration
     const body = document.createElement("p");
     const bits = [];
-    if (leg.headsign) bits.push('Mot ' + leg.headsign);
+    if (leg.headsign) bits.push(`Mot ${leg.headsign}`);
     if (Number.isFinite(leg.durationMin)) bits.push(`${leg.durationMin} min`);
-    body.textContent = bits.join(" · ");
+    body.textContent = bits.join(" - ");
 
     div.append(title, body);
     wrap.appendChild(div);
@@ -228,7 +232,7 @@ function extractShapes(routeJson) {
    Route geometry helpers (fallback)
    ============================ */
 
-// Cache stops so we don’t re-fetch the same ones
+// Cache stops so we don't re-fetch the same ones
 const stopCache = new Map(); // key -> { id,name,lat,lon }
 function putStopInCache(s) {
   if (!s) return;
@@ -303,15 +307,24 @@ async function legsToGeometry(legs = []) {
   return { segments, nodes: uniqueNodes };
 }
 
-function addStopMarkers(nodes = []) {
-  for (const n of nodes) {
-    if (Number.isFinite(n.lat) && Number.isFinite(n.lon)) {
-      const m = L.circleMarker([n.lat, n.lon], {
-        radius: 5,
-        weight: 2,
-        fillOpacity: 0.9
-      }).bindTooltip(n.name || "", { direction: "top", offset: [0, -6] });
-      routeLayer.addLayer(m);
+function addStopMarkers(nodes = [], markFirst = false, markLast = false) {
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    const isFirst = i === 0;
+    const isLast = i === nodes.length - 1;
+    
+    // Only add marker if it's first or last and we want to mark it
+    if ((isFirst && markFirst) || (isLast && markLast)) {
+      if (Number.isFinite(n.lat) && Number.isFinite(n.lon)) {
+        const m = L.circleMarker([n.lat, n.lon], {
+          radius: 6,
+          weight: 2,
+          fillOpacity: 0.9,
+          color: '#fff',
+          fillColor: isFirst ? '#2ecc71' : '#e74c3c'
+        }).bindTooltip(n.name || "", { direction: "top", offset: [0, -6] });
+        routeLayer.addLayer(m);
+      }
     }
   }
 }
@@ -338,7 +351,7 @@ async function wakeBackend() {
       await sleep(800 + a * 400);
     } else {
       clearInterval(ticker);
-      bootMsg.textContent = "Server didn’t respond. Please refresh or try again shortly.";
+      bootMsg.textContent = "Server didn't respond. Please refresh or try again shortly.";
       return;
     }
   }
@@ -398,28 +411,46 @@ async function findRoute() {
     // 1) Prefer backend-provided shapes (future-proof)
     let drewAnything = false;
     if (Array.isArray(shapes) && shapes.length) {
-      for (const shape of shapes) {
-        if (shape && shape.length) { addPolyline(shape); drewAnything = true; }
+      for (let i = 0; i < shapes.length; i++) {
+        const shape = shapes[i];
+        if (shape && shape.length) { addPolyline(shape, getLegColor(i)); drewAnything = true; }
       }
     }
 
     // 2) Next, prefer hops (each leg carries every station with lat/lon)
     if (!drewAnything) {
       let anyHops = false;
-      for (const leg of legs) {
+      for (let legIdx = 0; legIdx < legs.length; legIdx++) {
+        const leg = legs[legIdx];
         if (Array.isArray(leg.hops) && leg.hops.length >= 2) {
           anyHops = true;
           const coords = leg.hops
             .filter(h => Number.isFinite(h.lat) && Number.isFinite(h.lon))
             .map(h => [h.lat, h.lon]);
-          addPolyline(coords);
+          addPolyline(coords, getLegColor(legIdx));
 
-          // markers for each hop
-          for (const h of leg.hops) {
-            if (Number.isFinite(h.lat) && Number.isFinite(h.lon)) {
-              const m = L.circleMarker([h.lat, h.lon], {
-                radius: 5, weight: 2, fillOpacity: 0.9
-              }).bindTooltip(h.name || "", { direction: "top", offset: [0, -6] });
+          // Only mark first station of first leg and last station of last leg
+          const isFirstLeg = legIdx === 0;
+          const isLastLeg = legIdx === legs.length - 1;
+          
+          if (isFirstLeg && leg.hops.length > 0) {
+            const first = leg.hops[0];
+            if (Number.isFinite(first.lat) && Number.isFinite(first.lon)) {
+              const m = L.circleMarker([first.lat, first.lon], {
+                radius: 6, weight: 2, fillOpacity: 0.9,
+                color: '#fff', fillColor: '#2ecc71'
+              }).bindTooltip(first.name || "", { direction: "top", offset: [0, -6] });
+              routeLayer.addLayer(m);
+            }
+          }
+          
+          if (isLastLeg && leg.hops.length > 0) {
+            const last = leg.hops[leg.hops.length - 1];
+            if (Number.isFinite(last.lat) && Number.isFinite(last.lon)) {
+              const m = L.circleMarker([last.lat, last.lon], {
+                radius: 6, weight: 2, fillOpacity: 0.9,
+                color: '#fff', fillColor: '#e74c3c'
+              }).bindTooltip(last.name || "", { direction: "top", offset: [0, -6] });
               routeLayer.addLayer(m);
             }
           }
@@ -429,8 +460,11 @@ async function findRoute() {
       // 3) Fallback: just connect leg endpoints via /api/stops lookups
       if (!anyHops) {
         const { segments, nodes } = await legsToGeometry(legs);
-        for (const seg of segments) addPolyline(seg);
-        addStopMarkers(nodes);
+        for (let i = 0; i < segments.length; i++) {
+          addPolyline(segments[i], getLegColor(i));
+        }
+        // Mark only first and last nodes
+        addStopMarkers(nodes, true, true);
       }
     }
 
