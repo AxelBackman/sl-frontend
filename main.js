@@ -183,7 +183,7 @@ function renderLegs(legs = [], summary = "") {
     // Body shows line/headsign, trip, duration
     const body = document.createElement("p");
     const bits = [];
-    if (leg.headsign) bits.push('Mot ${leg.headsign}');
+    if (leg.headsign) bits.push('Mot ' + leg.headsign);
     if (Number.isFinite(leg.durationMin)) bits.push(`${leg.durationMin} min`);
     body.textContent = bits.join(" · ");
 
