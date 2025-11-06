@@ -307,28 +307,6 @@ async function legsToGeometry(legs = []) {
   return { segments, nodes: uniqueNodes };
 }
 
-function addStopMarkers(nodes = [], markFirst = false, markLast = false) {
-  for (let i = 0; i < nodes.length; i++) {
-    const n = nodes[i];
-    const isFirst = i === 0;
-    const isLast = i === nodes.length - 1;
-    
-    // Only add marker if it's first or last and we want to mark it
-    if ((isFirst && markFirst) || (isLast && markLast)) {
-      if (Number.isFinite(n.lat) && Number.isFinite(n.lon)) {
-        const m = L.circleMarker([n.lat, n.lon], {
-          radius: 6,
-          weight: 2,
-          fillOpacity: 0.9,
-          color: '#fff',
-          fillColor: isFirst ? '#2ecc71' : '#e74c3c'
-        }).bindTooltip(n.name || "", { direction: "top", offset: [0, -6] });
-        routeLayer.addLayer(m);
-      }
-    }
-  }
-}
-
 /* ============================
    Backend warmup (use /health)
    ============================ */
@@ -429,31 +407,7 @@ async function findRoute() {
             .map(h => [h.lat, h.lon]);
           addPolyline(coords, getLegColor(legIdx));
 
-          // Only mark first station of first leg and last station of last leg
-          const isFirstLeg = legIdx === 0;
-          const isLastLeg = legIdx === legs.length - 1;
-          
-          if (isFirstLeg && leg.hops.length > 0) {
-            const first = leg.hops[0];
-            if (Number.isFinite(first.lat) && Number.isFinite(first.lon)) {
-              const m = L.circleMarker([first.lat, first.lon], {
-                radius: 6, weight: 2, fillOpacity: 0.9,
-                color: '#fff', fillColor: '#2ecc71'
-              }).bindTooltip(first.name || "", { direction: "top", offset: [0, -6] });
-              routeLayer.addLayer(m);
-            }
-          }
-          
-          if (isLastLeg && leg.hops.length > 0) {
-            const last = leg.hops[leg.hops.length - 1];
-            if (Number.isFinite(last.lat) && Number.isFinite(last.lon)) {
-              const m = L.circleMarker([last.lat, last.lon], {
-                radius: 6, weight: 2, fillOpacity: 0.9,
-                color: '#fff', fillColor: '#e74c3c'
-              }).bindTooltip(last.name || "", { direction: "top", offset: [0, -6] });
-              routeLayer.addLayer(m);
-            }
-          }
+          // No additional markers needed - using existing blue markers from search
         }
       }
 
@@ -463,8 +417,7 @@ async function findRoute() {
         for (let i = 0; i < segments.length; i++) {
           addPolyline(segments[i], getLegColor(i));
         }
-        // Mark only first and last nodes
-        addStopMarkers(nodes, true, true);
+        // No additional markers needed - using existing blue markers from search
       }
     }
 
