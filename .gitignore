@@ -15,11 +15,11 @@ pnpm-debug.log*
 .cache/
 .tmp/
 
-# Builds (if you add a bundler later)
+# Builds
 dist/
 build/
 
-# Node (if you add tooling later)
+# Node
 node_modules/
 
 # Misc
